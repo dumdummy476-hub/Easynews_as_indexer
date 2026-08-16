@@ -100,11 +100,14 @@ def _normalize_imdb_id(value: Optional[str]) -> Optional[str]:
     return None
 
 
-def _tmdb_original_title(imdb_value: Optional[str]) -> Optional[str]:
+def _tmdb_movie_titles(
+    imdb_value: Optional[str],
+) -> Optional[Dict[str, str]]:
     """
-    Resolve only the canonical TMDB original_title for an IMDb movie ID.
+    Resolve TMDB's English/display title and canonical original title.
 
-    This is intentionally conservative:
+    This remains intentionally conservative:
+    - IMDb ID lookup only
     - no text search
     - no alternative-title fan-out
     - no translated-title guessing
@@ -136,11 +139,33 @@ def _tmdb_original_title(imdb_value: Optional[str]) -> Optional[str]:
     if not movies:
         return None
 
-    original_title = str(
-        movies[0].get("original_title") or ""
+    movie = movies[0]
+
+    title = str(
+        movie.get("title") or ""
     ).strip()
 
-    return original_title or None
+    original_title = str(
+        movie.get("original_title") or ""
+    ).strip()
+
+    if not title and not original_title:
+        return None
+
+    return {
+        "title": title or original_title,
+        "original_title": original_title or title,
+    }
+
+
+def _tmdb_original_title(imdb_value: Optional[str]) -> Optional[str]:
+    """Compatibility helper returning only TMDB's original title."""
+    titles = _tmdb_movie_titles(imdb_value)
+
+    if not titles:
+        return None
+
+    return titles.get("original_title") or None
 
 
 def _release_merge_key(item: dict) -> str:
@@ -1118,6 +1143,8 @@ def api():
             or request.args.get("imdb")
         )
 
+        tmdb_original_title_hint: Optional[str] = None
+
         # AIOStreams prefers imdbid over q when the indexer advertises
         # IMDb-ID support. Resolve an IMDb-only movie request to TMDB's
         # canonical original_title before constructing the Easynews query.
@@ -1136,14 +1163,29 @@ def api():
 
             if tmdb_id_lookup_enabled:
                 try:
-                    resolved_title = _tmdb_original_title(imdb_param)
+                    resolved_titles = _tmdb_movie_titles(imdb_param)
 
-                    if resolved_title:
-                        base_query = resolved_title
+                    if resolved_titles:
+                        display_title = (
+                            resolved_titles.get("title") or ""
+                        ).strip()
+                        tmdb_original_title_hint = (
+                            resolved_titles.get("original_title") or ""
+                        ).strip() or None
+
+                        base_query = (
+                            display_title
+                            or tmdb_original_title_hint
+                            or _normalize_imdb_id(imdb_param)
+                            or str(imdb_param).strip()
+                        )
+
                         APP.logger.info(
-                            "TMDB IMDb-only movie lookup: %r -> %r",
+                            "TMDB IMDb-only movie lookup: %r -> "
+                            "display=%r original=%r",
                             imdb_param,
-                            resolved_title,
+                            base_query,
+                            tmdb_original_title_hint,
                         )
                     else:
                         base_query = (
@@ -1350,7 +1392,10 @@ def api():
             )
 
             try:
-                original_title = _tmdb_original_title(imdb_param)
+                original_title = (
+                    tmdb_original_title_hint
+                    or _tmdb_original_title(imdb_param)
+                )
 
                 requested_title_key = re.sub(
                     r"\s+",
