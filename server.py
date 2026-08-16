@@ -757,7 +757,7 @@ def api():
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<caps>"
             '<server version="0.1" title="Easynews Bridge"/>'
-            '<limits max="100" default="100"/>'
+            '<limits max="300" default="100"/>'
             '<registration available="no" open="no"/>'
             "<searching>"
             '<search available="yes" supportedParams="q"/>'
