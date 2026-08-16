@@ -158,6 +158,59 @@ def _tmdb_movie_titles(
     }
 
 
+def _tmdb_tv_titles_from_tvdb(
+    tvdb_value: Optional[str],
+) -> Optional[Dict[str, str]]:
+    """
+    Resolve a TVDB series ID through TMDB and return both the
+    English/display name and canonical original name.
+    """
+    api_key = os.environ.get("TMDB_API_KEY", "").strip()
+
+    if not api_key:
+        return None
+
+    tvdb_id = str(tvdb_value or "").strip()
+
+    if not re.fullmatch(r"\d+", tvdb_id):
+        return None
+
+    response = requests.get(
+        f"https://api.themoviedb.org/3/find/{tvdb_id}",
+        params={
+            "api_key": api_key,
+            "external_source": "tvdb_id",
+            "language": "en-US",
+        },
+        timeout=5,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    shows = payload.get("tv_results") or []
+
+    if not shows:
+        return None
+
+    show = shows[0]
+
+    name = str(
+        show.get("name") or ""
+    ).strip()
+
+    original_name = str(
+        show.get("original_name") or ""
+    ).strip()
+
+    if not name and not original_name:
+        return None
+
+    return {
+        "name": name or original_name,
+        "original_name": original_name or name,
+    }
+
+
 def _tmdb_original_title(imdb_value: Optional[str]) -> Optional[str]:
     """Compatibility helper returning only TMDB's original title."""
     titles = _tmdb_movie_titles(imdb_value)
@@ -1110,7 +1163,7 @@ def api():
             "<searching>"
             '<search available="yes" supportedParams="q"/>'
             '<movie-search available="yes" supportedParams="q,year,imdbid"/>'
-            '<tv-search available="yes" supportedParams="q,season,ep"/>'
+            '<tv-search available="yes" supportedParams="q,season,ep,tvdbid"/>'
             "</searching>"
             "<categories>"
             '<category id="2000" name="Movies">'
@@ -1142,8 +1195,13 @@ def api():
             request.args.get("imdbid")
             or request.args.get("imdb")
         )
+        tvdb_param = (
+            request.args.get("tvdbid")
+            or request.args.get("tvdb")
+        )
 
         tmdb_original_title_hint: Optional[str] = None
+        tmdb_tv_original_name_hint: Optional[str] = None
 
         # AIOStreams prefers imdbid over q when the indexer advertises
         # IMDb-ID support. Resolve an IMDb-only movie request to TMDB's
@@ -1202,6 +1260,59 @@ def api():
                         _normalize_imdb_id(imdb_param)
                         or str(imdb_param).strip()
                     )
+
+        # TVDB-only TV search.
+        #
+        # Once tvdbid support is advertised, AIOStreams will prefer the
+        # stable TVDB ID instead of sending q. Resolve that ID through
+        # TMDB before constructing the Easynews title + SxxExx query.
+        if t == "tvsearch" and not base_query and tvdb_param:
+            tmdb_tv_lookup_enabled = (
+                os.environ.get(
+                    "EASYNEWS_TMDB_ORIGINAL_TITLE_FALLBACK",
+                    "false",
+                ).strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+
+            if tmdb_tv_lookup_enabled:
+                try:
+                    resolved_tv = _tmdb_tv_titles_from_tvdb(tvdb_param)
+
+                    if resolved_tv:
+                        display_name = (
+                            resolved_tv.get("name") or ""
+                        ).strip()
+
+                        tmdb_tv_original_name_hint = (
+                            resolved_tv.get("original_name") or ""
+                        ).strip() or None
+
+                        base_query = (
+                            display_name
+                            or tmdb_tv_original_name_hint
+                            or str(tvdb_param).strip()
+                        )
+
+                        APP.logger.info(
+                            "TMDB TVDB-only lookup: %r -> "
+                            "display=%r original=%r",
+                            tvdb_param,
+                            base_query,
+                            tmdb_tv_original_name_hint,
+                        )
+                    else:
+                        base_query = str(tvdb_param).strip()
+
+                except Exception as e:
+                    APP.logger.warning(
+                        "TMDB TVDB-only lookup failed for %r: %s",
+                        tvdb_param,
+                        e,
+                    )
+                    base_query = str(tvdb_param).strip()
+            else:
+                base_query = str(tvdb_param).strip()
 
         season_int = _as_int(season_param)
         episode_int = _as_int(episode_param)
