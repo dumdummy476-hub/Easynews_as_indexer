@@ -6,6 +6,7 @@ import re
 import threading
 import time
 from datetime import datetime, timezone, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Set
 from urllib.parse import quote
 
@@ -14,6 +15,7 @@ from flask import Flask, Response, request
 import json
 
 from easynews_client import EasynewsClient, EasynewsError, SearchItem
+from nzbindex_client import search_nzbindex, download_nzbindex_nzb
 
 
 APP = Flask(__name__)
@@ -913,6 +915,207 @@ def filter_and_map(
     return out
 
 
+
+_NZBINDEX_VIDEO_EXTENSIONS = {
+    ".mkv",
+    ".mp4",
+    ".m4v",
+    ".avi",
+    ".mov",
+    ".ts",
+    ".m2ts",
+    ".wmv",
+}
+
+
+def _clean_nzbindex_subject(subject: str) -> str:
+    subject = str(subject or "").strip()
+
+    # Most NZBIndex RSS entries expose the real payload filename
+    # inside quotes:
+    #
+    # [1/3] - "Release.Name.mkv" yEnc ...
+    quoted = re.search(r'"([^"]+)"', subject)
+    if quoted:
+        return quoted.group(1).strip()
+
+    # Handle entries without quoted filenames.
+    cleaned = re.sub(
+        r"^\[\d+/\d+\]\s*-\s*",
+        "",
+        subject,
+    ).strip()
+
+    cleaned = re.sub(
+        r"\s+yEnc(?:\s+.*)?$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    return cleaned.strip("[] ")
+
+
+def map_nzbindex_results(
+    raw_items: List[Dict[str, Any]],
+    min_bytes: int,
+    query_meta: Optional[Dict[str, Optional[Any]]] = None,
+    media_type: Optional[str] = None,
+) -> List[dict]:
+    """
+    Convert NZBIndex RSS collections into the bridge's internal
+    Newznab result shape.
+
+    This stage intentionally does not download the NZB.
+
+    Obvious non-video / tiny collections are rejected before they
+    reach AIOStreams.
+    """
+
+    query_meta = query_meta or {}
+
+    # Prevent tiny PAR2/subtitle/sample-looking collections from being
+    # exposed as playable streams even when the bridge min-size is low.
+    effective_min_bytes = max(
+        int(min_bytes or 0),
+        50 * 1024 * 1024,
+    )
+
+    requested_year = query_meta.get("year")
+    requested_season = query_meta.get("season")
+    requested_episode = query_meta.get("episode")
+
+    out: List[dict] = []
+
+    for raw in raw_items:
+        collection_id = str(raw.get("id") or "").strip()
+        if not collection_id:
+            continue
+
+        rss_title = str(raw.get("title") or "").strip()
+        filename = _clean_nzbindex_subject(rss_title)
+
+        if not filename:
+            continue
+
+        try:
+            size = int(raw.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+
+        if size < effective_min_bytes:
+            continue
+
+        ext = os.path.splitext(filename)[1].lower()
+
+        # This rejects .par2, .srt, .nfo, etc., including collections
+        # whose first RSS item is a subtitle/recovery file.
+        if ext not in _NZBINDEX_VIDEO_EXTENSIONS:
+            continue
+
+        # Preserve TV episode matching ourselves rather than trusting
+        # RSS text search alone.
+        if media_type == "tvsearch" and requested_season is not None:
+            try:
+                season_num = int(requested_season)
+            except (TypeError, ValueError):
+                season_num = None
+
+            try:
+                episode_num = (
+                    int(requested_episode)
+                    if requested_episode is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                episode_num = None
+
+            if season_num is not None:
+                if episode_num is not None:
+                    episode_pattern = re.compile(
+                        rf"(?i)(?<![A-Za-z0-9])"
+                        rf"S0*{season_num}E0*{episode_num}"
+                        rf"(?!\d)"
+                    )
+
+                    if not episode_pattern.search(filename):
+                        continue
+
+                else:
+                    season_pattern = re.compile(
+                        rf"(?i)(?<![A-Za-z0-9])"
+                        rf"S0*{season_num}"
+                        rf"(?!\d)"
+                    )
+
+                    if not season_pattern.search(filename):
+                        continue
+
+        # Movie year enforcement. Do not apply this to TV because the
+        # show's release year is commonly absent from episode filenames.
+        if media_type == "movie" and requested_year:
+            try:
+                year_num = int(requested_year)
+            except (TypeError, ValueError):
+                year_num = None
+
+            if year_num is not None:
+                if not re.search(
+                    rf"(?<!\d){year_num}(?!\d)",
+                    filename,
+                ):
+                    continue
+
+        posted = None
+
+        try:
+            pub_date = str(raw.get("pub_date") or "").strip()
+
+            if pub_date:
+                posted = parsedate_to_datetime(pub_date)
+
+                if posted and posted.tzinfo is None:
+                    posted = posted.replace(tzinfo=timezone.utc)
+
+        except Exception:
+            posted = None
+
+        out.append(
+            {
+                # Common result identity fields.
+                "hash": collection_id,
+                "title": filename,
+                "filename": filename,
+                "ext": ext,
+                "size": size,
+                "posted": posted,
+                "poster": "NZBIndex",
+
+                # New source routing information.
+                "source": "nzbindex",
+                "collection_id": collection_id,
+
+                # Metadata used by existing Newznab output.
+                "duration_hms": None,
+                "quality": None,
+                "thumbnail": None,
+
+                "year": requested_year,
+                "season": requested_season,
+                "episode": requested_episode,
+
+                "resolution_raw": None,
+                "video_codec": None,
+                "audio_codec": None,
+                "audio_languages": None,
+                "subtitle_languages": None,
+                "bitrate": None,
+            }
+        )
+
+    return out
+
+
 def map_posted_nzbs(
     c: EasynewsClient,
     json_data: dict,
@@ -1732,6 +1935,133 @@ def api():
                     e,
                 )
 
+        # Optional NZBIndex RSS discovery fallback.
+        #
+        # Easynews VIDEO remains primary. NZBIndex is only queried when
+        # the normal result count is below the configured threshold.
+        #
+        # Keep disabled by default until t=get routing has been tested.
+        nzbindex_enabled = (
+            os.environ.get(
+                "NZBINDEX_FALLBACK",
+                "false",
+            ).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
+        if (
+            not fallback_query
+            and nzbindex_enabled
+        ):
+            try:
+                nzbindex_trigger = max(
+                    0,
+                    int(
+                        os.environ.get(
+                            "NZBINDEX_TRIGGER",
+                            os.environ.get(
+                                "EASYNEWS_V3_NZB_TRIGGER",
+                                "20",
+                            ),
+                        )
+                    ),
+                )
+            except ValueError:
+                nzbindex_trigger = 20
+
+            if len(items) < nzbindex_trigger:
+                try:
+                    nzbindex_max_results = max(
+                        1,
+                        min(
+                            int(
+                                os.environ.get(
+                                    "NZBINDEX_MAX_RESULTS",
+                                    "250",
+                                )
+                            ),
+                            250,
+                        ),
+                    )
+                except ValueError:
+                    nzbindex_max_results = 250
+
+                try:
+                    nzbindex_timeout = max(
+                        3,
+                        min(
+                            int(
+                                os.environ.get(
+                                    "NZBINDEX_TIMEOUT",
+                                    "10",
+                                )
+                            ),
+                            30,
+                        ),
+                    )
+                except ValueError:
+                    nzbindex_timeout = 10
+
+                nzbindex_query = q
+
+                try:
+                    APP.logger.info(
+                        "NZBIndex RSS fallback triggered for %r "
+                        "(Easynews results=%s, trigger=%s)",
+                        nzbindex_query,
+                        len(items),
+                        nzbindex_trigger,
+                    )
+
+                    raw_nzbindex_items = search_nzbindex(
+                        nzbindex_query,
+                        max_results=nzbindex_max_results,
+                        timeout=nzbindex_timeout,
+                    )
+
+                    nzbindex_items = map_nzbindex_results(
+                        raw_nzbindex_items,
+                        min_bytes=min_bytes,
+                        query_meta=query_meta,
+                        media_type=t,
+                    )
+
+                    existing_keys = {
+                        _release_merge_key(item)
+                        for item in items
+                        if _release_merge_key(item)
+                    }
+
+                    added = 0
+
+                    for nzbindex_item in nzbindex_items:
+                        key = _release_merge_key(nzbindex_item)
+
+                        if key and key in existing_keys:
+                            continue
+
+                        items.append(nzbindex_item)
+
+                        if key:
+                            existing_keys.add(key)
+
+                        added += 1
+
+                    APP.logger.info(
+                        "NZBIndex RSS fallback added %s release(s) "
+                        "from %s raw result(s)",
+                        added,
+                        len(raw_nzbindex_items),
+                    )
+
+                except Exception as e:
+                    # NZBIndex must never break normal Easynews results.
+                    APP.logger.warning(
+                        "NZBIndex RSS fallback failed for %r: %s",
+                        nzbindex_query,
+                        e,
+                    )
+
         # Optional Easynews V3 posted-NZB fallback.
         #
         # Normal VIDEO search remains the primary path. Only when it
@@ -2063,6 +2393,66 @@ def api():
                 f'attachment; filename="{safe_title}.nzb"'
             )
             return resp
+        if d.get("source") == "nzbindex":
+            collection_id = (
+                d.get("collection_id")
+                or d.get("hash")
+            )
+
+            if not collection_id:
+                return Response(
+                    "Missing NZBIndex collection ID",
+                    status=400,
+                )
+
+            try:
+                nzb_content = download_nzbindex_nzb(
+                    str(collection_id),
+                    timeout=20,
+                )
+
+            except requests.exceptions.RequestException as e:
+                return Response(
+                    f"NZBIndex network error: {e}",
+                    status=502,
+                )
+
+            except Exception as e:
+                return Response(
+                    f"NZBIndex download error: {e}",
+                    status=502,
+                )
+
+            title = (
+                d.get("title")
+                or d.get("filename")
+                or "download"
+            )
+
+            safe_title = (
+                "".join(
+                    ch
+                    for ch in title
+                    if ch.isalnum()
+                    or ch in (" ", "-", "_", ".")
+                )[:200].strip()
+                or "download"
+            )
+
+            if safe_title.lower().endswith(".nzb"):
+                safe_title = safe_title[:-4]
+
+            resp = Response(
+                nzb_content,
+                mimetype="application/x-nzb",
+            )
+
+            resp.headers["Content-Disposition"] = (
+                f'attachment; filename="{safe_title}.nzb"'
+            )
+
+            return resp
+
         if d.get("source") == "posted_nzb":
             mid = d.get("mid")
 
