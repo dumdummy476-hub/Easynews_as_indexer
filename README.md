@@ -1,4 +1,3 @@
-# [☕ Please support my work on Buy Me a Coffee](https://buymeacoffee.com/gaikwadsank)
 
 # Easynews Newznab-like server
 
