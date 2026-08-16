@@ -17,6 +17,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -243,45 +244,61 @@ class EasynewsClient:
 
         url = f"{EASYNEWS_BASE}/3.0/api/search"
 
-        try:
-            # Use an independent request rather than sharing Session state
-            # between worker threads. Authentication is HTTP Basic Auth.
-            r = requests.get(
-                url,
-                params=params,
-                auth=(self.username, self.password),
-                headers=dict(self.s.headers),
-                timeout=_SEARCH_TIMEOUT,
-            )
-
-            if r.status_code in (401, 403):
-                raise EasynewsError("Unauthorized; check username/password")
-
-            r.raise_for_status()
-
-            if not r.content:
-                raise EasynewsError(
-                    f"Easynews V3 returned an empty response for page {page}"
+        for attempt in range(1, 4):
+            try:
+                # Use an independent request rather than sharing Session state
+                # between worker threads. Authentication is HTTP Basic Auth.
+                r = requests.get(
+                    url,
+                    params=params,
+                    auth=(self.username, self.password),
+                    headers=dict(self.s.headers),
+                    timeout=_SEARCH_TIMEOUT,
                 )
 
-            try:
-                return r.json()
-            except ValueError as e:
-                raise EasynewsError(
-                    f"Easynews V3 returned invalid JSON for page {page}"
-                ) from e
+                if r.status_code in (401, 403):
+                    raise EasynewsError("Unauthorized; check username/password")
 
-        except EasynewsError:
-            raise
-        except RequestException as e:
-            logger.exception(
-                "Easynews V3 search failed for query '%s', page %s",
-                query,
-                page,
-            )
-            raise EasynewsError(
-                f"Easynews V3 search request failed on page {page}: {e}"
-            ) from e
+                r.raise_for_status()
+
+                if not r.content:
+                    raise EasynewsError(
+                        f"Easynews V3 returned an empty response for page {page}"
+                    )
+
+                try:
+                    return r.json()
+                except ValueError as e:
+                    raise EasynewsError(
+                        f"Easynews V3 returned invalid JSON for page {page}"
+                    ) from e
+
+            except EasynewsError:
+                raise
+
+            except RequestException as e:
+                if attempt < 3:
+                    delay = 0.5 * attempt
+                    logger.warning(
+                        "Easynews V3 transient request failure for query %r, page %s "
+                        "(attempt %s/3): %s; retrying in %.1fs",
+                        query,
+                        page,
+                        attempt,
+                        e,
+                        delay,
+                    )
+                    time.sleep(delay)
+                    continue
+
+                logger.exception(
+                    "Easynews V3 search failed for query %r, page %s after 3 attempts",
+                    query,
+                    page,
+                )
+                raise EasynewsError(
+                    f"Easynews V3 search request failed on page {page} after 3 attempts: {e}"
+                ) from e
 
     def _search_v3(
         self,
