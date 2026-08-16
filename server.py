@@ -1084,7 +1084,7 @@ def api():
             '<registration available="no" open="no"/>'
             "<searching>"
             '<search available="yes" supportedParams="q"/>'
-            '<movie-search available="yes" supportedParams="q,year"/>'
+            '<movie-search available="yes" supportedParams="q,year,imdbid"/>'
             '<tv-search available="yes" supportedParams="q,season,ep"/>'
             "</searching>"
             "<categories>"
@@ -1113,6 +1113,54 @@ def api():
             or request.args.get("episode")
         )
         year_param = request.args.get("year") or request.args.get("yr")
+        imdb_param = (
+            request.args.get("imdbid")
+            or request.args.get("imdb")
+        )
+
+        # AIOStreams prefers imdbid over q when the indexer advertises
+        # IMDb-ID support. Resolve an IMDb-only movie request to TMDB's
+        # canonical original_title before constructing the Easynews query.
+        #
+        # If TMDB is temporarily unavailable, use the normalized IMDb ID
+        # as a harmless non-empty query instead of treating the request as
+        # a Prowlarr validation call and returning a fake sample result.
+        if t == "movie" and not base_query and imdb_param:
+            tmdb_id_lookup_enabled = (
+                os.environ.get(
+                    "EASYNEWS_TMDB_ORIGINAL_TITLE_FALLBACK",
+                    "false",
+                ).strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+
+            if tmdb_id_lookup_enabled:
+                try:
+                    resolved_title = _tmdb_original_title(imdb_param)
+
+                    if resolved_title:
+                        base_query = resolved_title
+                        APP.logger.info(
+                            "TMDB IMDb-only movie lookup: %r -> %r",
+                            imdb_param,
+                            resolved_title,
+                        )
+                    else:
+                        base_query = (
+                            _normalize_imdb_id(imdb_param)
+                            or str(imdb_param).strip()
+                        )
+                except Exception as e:
+                    APP.logger.warning(
+                        "TMDB IMDb-only movie lookup failed for %r: %s",
+                        imdb_param,
+                        e,
+                    )
+                    base_query = (
+                        _normalize_imdb_id(imdb_param)
+                        or str(imdb_param).strip()
+                    )
+
         season_int = _as_int(season_param)
         episode_int = _as_int(episode_param)
         year_int = _as_int(year_param)
