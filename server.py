@@ -344,6 +344,45 @@ def _format_duration(seconds: Optional[int]) -> Optional[str]:
     return f"{hours:02}:{minutes:02}:{secs:02}"
 
 
+def _clean_mojibake_title(text: str) -> str:
+    """
+    Remove obviously corrupted bracketed suffixes returned by Easynews.
+
+    Important:
+    - Only affects the display/search title.
+    - The original Easynews filename remains untouched for NZB generation.
+    - Normal Unicode and legitimate bracketed release groups are preserved.
+    """
+    if not text:
+        return text
+
+    mojibake_markers = ("Ã", "Â", "\ufffd")
+
+    def bad_bracket(match):
+        content = match.group(1)
+
+        marker_count = sum(content.count(x) for x in mojibake_markers)
+        control_count = sum(
+            1 for ch in content
+            if 0x80 <= ord(ch) <= 0x9F
+        )
+
+        if marker_count >= 2 or control_count:
+            return ""
+
+        return match.group(0)
+
+    cleaned = re.sub(r"\[([^\[\]]*)\]", bad_bracket, text)
+
+    # Clean whitespace/dots left behind after removing a bad suffix.
+    cleaned = re.sub(r"\.{2,}", ".", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+\.", ".", cleaned)
+    cleaned = cleaned.strip(" ._-")
+
+    return cleaned
+
+
 def _extract_quality(*texts: Optional[str]) -> Optional[str]:
     for text in texts:
         if not text:
@@ -550,6 +589,14 @@ def filter_and_map(
         duration_raw: Any = None
         fullres: Optional[str] = None
 
+        # Easynews V3 rich media metadata
+        resolution_raw: Optional[str] = None
+        video_codec: Optional[str] = None
+        audio_codec: Optional[str] = None
+        audio_languages: Any = None
+        subtitle_languages: Any = None
+        bitrate: Any = None
+
         if isinstance(it, list):
             if len(it) >= 12:
                 hash_id = it[0]
@@ -565,8 +612,8 @@ def filter_and_map(
         elif isinstance(it, dict):
             hash_id = it.get("hash") or it.get("0") or it.get("id")
             subject = it.get("subject") or it.get("6")
-            filename_no_ext = it.get("filename") or it.get("10")
-            ext = it.get("ext") or it.get("11")
+            filename_no_ext = it.get("filename") or it.get("fn") or it.get("10")
+            ext = it.get("ext") or it.get("extension") or it.get("11")
             size = it.get("size", 0)
             poster = it.get("poster") or it.get("7")
             posted_raw = it.get("timestamp") or it.get("ts") or it.get("dtime") or it.get("date") or it.get("12")
@@ -575,6 +622,21 @@ def filter_and_map(
             extension_field = it.get("extension") or it.get("ext")
             duration_raw = it.get("14") or it.get("duration") or it.get("len")
             fullres = it.get("fullres") or it.get("resolution")
+
+            # Easynews V3 media metadata
+            xres = it.get("xres") or it.get("width")
+            yres = it.get("yres") or it.get("height")
+
+            if xres and yres:
+                resolution_raw = f"{xres}x{yres}"
+            elif fullres:
+                resolution_raw = str(fullres)
+
+            video_codec = it.get("vcodec")
+            audio_codec = it.get("acodec")
+            audio_languages = it.get("audio_tracks") or it.get("alang")
+            subtitle_languages = it.get("subtitle_tracks") or it.get("slang")
+            bitrate = it.get("bps")
 
         if not hash_id or not ext:
             continue
@@ -614,6 +676,10 @@ def filter_and_map(
         if not title:
             fallback = subject or f"{filename_no_ext}{ext}"
             title = _normalize_title(fallback)
+
+        # Easynews occasionally returns multiply-encoded garbage inside
+        # bracketed release-group suffixes. Clean display title only.
+        title = _clean_mojibake_title(title)
 
         quality = _extract_quality(title, fullres)
         title_meta = _extract_release_markers(title, quality)
@@ -667,6 +733,14 @@ def filter_and_map(
                 "year": year,
                 "season": title_meta.get("season"),
                 "episode": title_meta.get("episode"),
+
+                # Easynews V3 metadata retained for Newznab output
+                "resolution_raw": resolution_raw,
+                "video_codec": video_codec,
+                "audio_codec": audio_codec,
+                "audio_languages": audio_languages,
+                "subtitle_languages": subtitle_languages,
+                "bitrate": bitrate,
             }
         )
     return out
@@ -897,6 +971,55 @@ def api():
             season = it.get("season")
             episode = it.get("episode")
 
+            # Easynews V3 rich media metadata
+            resolution_raw = it.get("resolution_raw")
+            video_codec = it.get("video_codec")
+            audio_codec = it.get("audio_codec")
+            audio_languages = it.get("audio_languages")
+            subtitle_languages = it.get("subtitle_languages")
+
+            def normalize_metadata_values(value):
+                if value is None:
+                    return None
+
+                if isinstance(value, str):
+                    values = [value]
+                elif isinstance(value, (list, tuple, set)):
+                    values = list(value)
+                else:
+                    values = [value]
+
+                cleaned = []
+                seen = set()
+
+                for entry in values:
+                    if isinstance(entry, dict):
+                        entry = (
+                            entry.get("language")
+                            or entry.get("lang")
+                            or entry.get("code")
+                            or entry.get("name")
+                        )
+
+                    if entry is None:
+                        continue
+
+                    text = str(entry).strip()
+                    if not text:
+                        continue
+
+                    key = text.lower()
+                    if key in seen:
+                        continue
+
+                    seen.add(key)
+                    cleaned.append(text)
+
+                return ",".join(cleaned) if cleaned else None
+
+            audio_language_value = normalize_metadata_values(audio_languages)
+            subtitle_language_value = normalize_metadata_values(subtitle_languages)
+
             title_text = it.get("title", "")
             title_metadata = {
                 "season": season,
@@ -934,6 +1057,33 @@ def api():
                 attr_parts.append(f'<newznab:attr name="season" value="{season}"/>')
             if episode:
                 attr_parts.append(f'<newznab:attr name="episode" value="{episode}"/>')
+
+            # Easynews V3 rich metadata
+            if audio_language_value:
+                attr_parts.append(
+                    f'<newznab:attr name="language" value="{xml_escape(audio_language_value)}"/>'
+                )
+
+            if subtitle_language_value:
+                attr_parts.append(
+                    f'<newznab:attr name="subs" value="{xml_escape(subtitle_language_value)}"/>'
+                )
+
+            if resolution_raw:
+                attr_parts.append(
+                    f'<newznab:attr name="resolution" value="{xml_escape(str(resolution_raw))}"/>'
+                )
+
+            if video_codec:
+                attr_parts.append(
+                    f'<newznab:attr name="video" value="{xml_escape(str(video_codec))}"/>'
+                )
+
+            if audio_codec:
+                attr_parts.append(
+                    f'<newznab:attr name="audio" value="{xml_escape(str(audio_codec))}"/>'
+                )
+
             attr_xml = "".join(attr_parts)
             item_xml = (
                 f"<item>"

@@ -1,12 +1,15 @@
 """
-Easynews API-like client (unofficial) to perform searches and download NZB files.
+Unofficial Easynews client for Newznab-compatible search and NZB generation.
 
-This client mimics the webapp behavior by calling:
-- GET /2.0/search/solr-search for search results (JSON)
-- POST /2.0/api/dl-nzb to create/download NZB for selected items
+Search support:
+- Easynews Search API V3 via /3.0/api/search (default)
+- Legacy Easynews Search API V2 via /2.0/search/solr-search
+- Optional automatic V3 -> V2 fallback
+- Parallel pagination for V3 searches
 
-Authentication is cookie-based via username/password POST to the login endpoint.
-You'll need a valid Easynews account. Use responsibly and per Easynews TOS.
+NZB generation continues to use /2.0/api/dl-nzb.
+
+Authentication uses HTTP Basic Auth with a valid Easynews account.
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -75,74 +79,432 @@ class EasynewsClient:
 
     def login(self) -> None:
         """
-        Prime session and validate credentials using a quick authenticated call.
-        This relies on HTTP Basic Auth configured on the session.
+        Validate Easynews credentials using the configured search API.
+
+        EASYNEWS_SEARCH_API:
+          v3   - validate against Easynews Search API 3.0
+          v2   - validate against legacy Search API 2.0
+          auto - try V3 first, then V2 if V3 is unavailable
         """
-        try:
-            self.s.get(f"{EASYNEWS_BASE}/2.0/", timeout=_LOGIN_TIMEOUT)
-            check = self.s.get(
-                f"{EASYNEWS_BASE}/2.0/search/solr-search/?fly=2&gps=test&sb=1&pno=1&pby=1&u=1&chxu=1&chxgx=1&st=basic&s1=dtime&s1d=-&sS=3&vv=1&fty%5B%5D=VIDEO",
-                allow_redirects=True,
-                timeout=_LOGIN_TIMEOUT,
+        mode = os.environ.get("EASYNEWS_SEARCH_API", "v3").strip().lower()
+
+        if mode not in {"v2", "v3", "auto"}:
+            logger.warning(
+                "Unknown EASYNEWS_SEARCH_API=%r during login; defaulting to v3",
+                mode,
             )
-        except RequestException as e:
+            mode = "v3"
+
+        try:
+            if mode == "v2":
+                self._search_v2(
+                    query="test",
+                    page=1,
+                    per_page=1,
+                    file_type="VIDEO",
+                    sort_field="relevance",
+                    sort_dir="-",
+                    safe_off=0,
+                )
+                return
+
+            try:
+                self._search_v3_page(
+                    query="test",
+                    page=1,
+                    file_type="VIDEO",
+                    sort_field="relevance",
+                    sort_dir="-",
+                    safe_off=0,
+                )
+                return
+            except EasynewsError:
+                if mode != "auto":
+                    raise
+
+                logger.warning(
+                    "Easynews V3 login validation failed; trying V2"
+                )
+
+            self._search_v2(
+                query="test",
+                page=1,
+                per_page=1,
+                file_type="VIDEO",
+                sort_field="relevance",
+                sort_dir="-",
+                safe_off=0,
+            )
+
+        except EasynewsError:
+            raise
+        except Exception as e:
             logger.exception("Network error during Easynews login")
-            raise EasynewsError(f"Network error during Easynews login: {e}") from e
-        if check.status_code in (401, 403):
-            raise EasynewsError("Unauthorized; check username/password")
+            raise EasynewsError(
+                f"Network error during Easynews login: {e}"
+            ) from e
+
+    def _search_v2(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 250,
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Legacy Easynews Search API 2.0 fallback.
+
+        V2 supports up to 250 results per request. Keep this implementation
+        available for EASYNEWS_SEARCH_API=v2 or as an automatic fallback.
+        """
+        if file_type != "VIDEO":
+            file_type = "VIDEO"
+
+        params = {
+            "fly": "2",
+            "sb": "1",
+            "pno": str(page),
+            "pby": str(min(max(1, int(per_page)), 250)),
+            "u": "1",
+            "chxu": "1",
+            "chxgx": "1",
+            "st": "basic",
+            "gps": query,
+            "vv": "1",
+            "safeO": str(safe_off),
+        }
+
+        if sort_field:
+            params["s1"] = sort_field
+            params["s1d"] = sort_dir
+
+        url = f"{EASYNEWS_BASE}/2.0/search/solr-search/"
+
+        try:
+            r = self.s.get(
+                url,
+                params={**params, "fty[]": file_type},
+                timeout=_SEARCH_TIMEOUT,
+            )
+
+            if r.status_code in (401, 403):
+                raise EasynewsError("Unauthorized; check username/password")
+
+            r.raise_for_status()
+
+            try:
+                return r.json()
+            except ValueError as e:
+                raise EasynewsError(
+                    "Easynews V2 returned invalid JSON"
+                ) from e
+
+        except EasynewsError:
+            raise
+        except RequestException as e:
+            logger.exception(
+                "Easynews V2 search failed for query '%s'",
+                query,
+            )
+            raise EasynewsError(
+                f"Easynews V2 search request failed: {e}"
+            ) from e
+
+    def _search_v3_page(
+        self,
+        query: str,
+        page: int = 1,
+        file_type: str = "VIDEO",
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Fetch one page from Easynews Search API 3.0.
+
+        V3 always returns up to 100 results per page and ignores page-size
+        parameters such as pby/dni.
+        """
+        if file_type != "VIDEO":
+            file_type = "VIDEO"
+
+        params = {
+            "gps": query,
+            "pno": str(page),
+            "u": "1",
+            "safeO": str(safe_off),
+            "s1": sort_field or "relevance",
+            "s1d": sort_dir,
+            "fty[]": file_type,
+        }
+
+        url = f"{EASYNEWS_BASE}/3.0/api/search"
+
+        try:
+            # Use an independent request rather than sharing Session state
+            # between worker threads. Authentication is HTTP Basic Auth.
+            r = requests.get(
+                url,
+                params=params,
+                auth=(self.username, self.password),
+                headers=dict(self.s.headers),
+                timeout=_SEARCH_TIMEOUT,
+            )
+
+            if r.status_code in (401, 403):
+                raise EasynewsError("Unauthorized; check username/password")
+
+            r.raise_for_status()
+
+            if not r.content:
+                raise EasynewsError(
+                    f"Easynews V3 returned an empty response for page {page}"
+                )
+
+            try:
+                return r.json()
+            except ValueError as e:
+                raise EasynewsError(
+                    f"Easynews V3 returned invalid JSON for page {page}"
+                ) from e
+
+        except EasynewsError:
+            raise
+        except RequestException as e:
+            logger.exception(
+                "Easynews V3 search failed for query '%s', page %s",
+                query,
+                page,
+            )
+            raise EasynewsError(
+                f"Easynews V3 search request failed on page {page}: {e}"
+            ) from e
+
+    def _search_v3(
+        self,
+        query: str,
+        file_type: str = "VIDEO",
+        page: int = 1,
+        per_page: int = 250,
+        sort_field: Optional[str] = "relevance",
+        sort_dir: str = "-",
+        safe_off: int = 0,
+    ) -> Dict[str, Any]:
+        """
+        Search Easynews using API 3.0.
+
+        V3 has a fixed page size of 100. The legacy bridge requested 250
+        candidates, so a per_page=250 request maps to three V3 pages.
+
+        Page 1 is fetched first to learn numPages. Remaining pages are fetched
+        concurrently and merged. Duplicate hashes are removed.
+        """
+        if file_type != "VIDEO":
+            file_type = "VIDEO"
+
+        first_page_num = max(1, int(page))
+
+        first = self._search_v3_page(
+            query=query,
+            page=first_page_num,
+            file_type=file_type,
+            sort_field=sort_field,
+            sort_dir=sort_dir,
+            safe_off=safe_off,
+        )
+
+        try:
+            total_pages = max(1, int(first.get("numPages") or 1))
+        except (TypeError, ValueError):
+            total_pages = 1
+
+        # V3 always returns 100/page.
+        # 250 requested candidates => ceil(250 / 100) => 3 pages.
+        requested_pages = max(1, (max(1, int(per_page)) + 99) // 100)
+
+        # Safety/tuning knob. Default 3 keeps behavior close to the old
+        # bridge's 250-result V2 search while allowing overrides later.
+        try:
+            configured_max_pages = max(
+                1, int(os.environ.get("EASYNEWS_V3_MAX_PAGES", "3"))
+            )
+        except ValueError:
+            configured_max_pages = 3
+
+        pages_to_fetch = min(
+            requested_pages,
+            configured_max_pages,
+            max(1, total_pages - first_page_num + 1),
+        )
+
+        remaining_pages = list(
+            range(
+                first_page_num + 1,
+                first_page_num + pages_to_fetch,
+            )
+        )
+
+        page_results: Dict[int, Dict[str, Any]] = {}
+
+        if remaining_pages:
+            try:
+                configured_concurrency = max(
+                    1,
+                    min(
+                        10,
+                        int(os.environ.get("EASYNEWS_V3_CONCURRENCY", "10")),
+                    ),
+                )
+            except ValueError:
+                configured_concurrency = 10
+
+            max_workers = min(
+                configured_concurrency,
+                len(remaining_pages),
+            )
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(
+                        self._search_v3_page,
+                        query,
+                        pno,
+                        file_type,
+                        sort_field,
+                        sort_dir,
+                        safe_off,
+                    ): pno
+                    for pno in remaining_pages
+                }
+
+                for future in as_completed(futures):
+                    pno = futures[future]
+                    try:
+                        page_results[pno] = future.result()
+                    except Exception as e:
+                        # Keep successful pages instead of failing the entire
+                        # Prowlarr search because one secondary page failed.
+                        logger.warning(
+                            "Easynews V3 page %s failed for query '%s': %s",
+                            pno,
+                            query,
+                            e,
+                        )
+
+        merged_data: List[Any] = []
+        seen_hashes = set()
+
+        def add_items(response: Dict[str, Any]) -> None:
+            for item in response.get("data", []):
+                hash_id = None
+
+                if isinstance(item, dict):
+                    hash_id = (
+                        item.get("hash")
+                        or item.get("0")
+                        or item.get("id")
+                    )
+                elif isinstance(item, list) and item:
+                    hash_id = item[0]
+
+                # Deduplicate normal Easynews results by hash.
+                if hash_id:
+                    key = str(hash_id)
+                    if key in seen_hashes:
+                        continue
+                    seen_hashes.add(key)
+
+                merged_data.append(item)
+
+        add_items(first)
+
+        # Preserve page order despite concurrent requests.
+        for pno in sorted(page_results):
+            add_items(page_results[pno])
+
+        merged = dict(first)
+        merged["data"] = merged_data
+        merged["returned"] = len(merged_data)
+        merged["page"] = first_page_num
+
+        logger.info(
+            "Easynews V3 search '%s': %s candidates from %s page(s)",
+            query,
+            len(merged_data),
+            1 + len(page_results),
+        )
+
+        return merged
 
     def search(
         self,
         query: str,
         file_type: str = "VIDEO",
         page: int = 1,
-        per_page: int = 50,
-        sort_field: Optional[str] = "dtime",
+        per_page: int = 250,
+        sort_field: Optional[str] = "relevance",
         sort_dir: str = "-",
         safe_off: int = 0,
     ) -> Dict[str, Any]:
         """
-        Call the same Solr-backed endpoint used by the site.
-        Returns the raw JSON dict, including data and pagination fields.
+        Public search dispatcher.
+
+        EASYNEWS_SEARCH_API:
+          v3   - use Easynews Search API 3.0 (default)
+          v2   - use legacy Easynews Search API 2.0
+          auto - try V3 first, then fall back to V2 on failure
         """
-        if file_type != "VIDEO":
-            # Enforce VIDEO only as requested
-            file_type = "VIDEO"
+        mode = os.environ.get("EASYNEWS_SEARCH_API", "v3").strip().lower()
 
-        params = {
-            # Backend selector, 1 = solr-search
-            "fly": "2",
-            "sb": "1",
-            "pno": str(page),
-            "pby": str(per_page),
-            "u": "1",
-            "chxu": "1",
-            "chxgx": "1",
-            "st": "basic",
-            "gps": query,
-            "vv": "1",  # for VIDEO hover/preview data
-            "safeO": str(safe_off),
-        }
-        if sort_field:
-            params["s1"] = sort_field
-            params["s1d"] = sort_dir
+        if mode not in {"v2", "v3", "auto"}:
+            logger.warning(
+                "Unknown EASYNEWS_SEARCH_API=%r; defaulting to v3",
+                mode,
+            )
+            mode = "v3"
 
-        # fty[] is a repeated parameter
-        url = f"{EASYNEWS_BASE}/2.0/search/solr-search/"
-        # Manually build query string to include array param
-        query_params = (
-            "&".join([f"{k}={requests.utils.quote(v)}" for k, v in params.items()])
-            + f"&fty%5B%5D={requests.utils.quote(file_type)}"
-        )
-        full_url = f"{url}?{query_params}"
+        if mode == "v2":
+            return self._search_v2(
+                query=query,
+                file_type=file_type,
+                page=page,
+                per_page=per_page,
+                sort_field=sort_field,
+                sort_dir=sort_dir,
+                safe_off=safe_off,
+            )
 
         try:
-            r = self.s.get(full_url, timeout=_SEARCH_TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-        except RequestException as e:
-            logger.exception("Search request failed for query '%s'", query)
-            raise EasynewsError(f"Search request failed: {e}") from e
+            return self._search_v3(
+                query=query,
+                file_type=file_type,
+                page=page,
+                per_page=per_page,
+                sort_field=sort_field,
+                sort_dir=sort_dir,
+                safe_off=safe_off,
+            )
+        except EasynewsError:
+            if mode != "auto":
+                raise
+
+            logger.warning(
+                "Easynews V3 failed for query '%s'; falling back to V2",
+                query,
+            )
+
+            return self._search_v2(
+                query=query,
+                file_type=file_type,
+                page=page,
+                per_page=per_page,
+                sort_field=sort_field,
+                sort_dir=sort_dir,
+                safe_off=safe_off,
+            )
 
     @staticmethod
     def _collect_items(json_data: Dict[str, Any]) -> List[SearchItem]:
@@ -161,15 +523,28 @@ class EasynewsClient:
                     filename_no_ext = it[10]
                     ext = it[11]
             elif isinstance(it, dict):
-                # Some APIs may return dict with numeric keys as strings
-                if "0" in it:
-                    hash_id = it.get("0", "")
-                if "10" in it:
-                    filename_no_ext = it.get("10", "")
-                if "11" in it:
-                    ext = it.get("11", "")
+                # Support both Easynews V3 named fields and legacy V2
+                # numeric-string fields.
+                hash_id = (
+                    it.get("hash")
+                    or it.get("0")
+                    or it.get("id")
+                    or ""
+                )
+                filename_no_ext = (
+                    it.get("fn")
+                    or it.get("filename")
+                    or it.get("10")
+                    or ""
+                )
+                ext = (
+                    it.get("extension")
+                    or it.get("ext")
+                    or it.get("11")
+                    or ""
+                )
                 sig = it.get("sig")
-                typ = it.get("type", "")
+                typ = it.get("type") or "VIDEO"
                 item_id = it.get("id")
 
             if not hash_id or not ext:
