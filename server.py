@@ -84,6 +84,85 @@ def xml_escape(s: str) -> str:
     )
 
 
+def _normalize_imdb_id(value: Optional[str]) -> Optional[str]:
+    """Normalize Newznab imdbid values such as 0079264 to tt0079264."""
+    value = str(value or "").strip()
+
+    if not value:
+        return None
+
+    if re.fullmatch(r"\d+", value):
+        return f"tt{value}"
+
+    if re.fullmatch(r"tt\d+", value, flags=re.IGNORECASE):
+        return value.lower()
+
+    return None
+
+
+def _tmdb_original_title(imdb_value: Optional[str]) -> Optional[str]:
+    """
+    Resolve only the canonical TMDB original_title for an IMDb movie ID.
+
+    This is intentionally conservative:
+    - no text search
+    - no alternative-title fan-out
+    - no translated-title guessing
+    """
+    api_key = os.environ.get("TMDB_API_KEY", "").strip()
+
+    if not api_key:
+        return None
+
+    imdb_id = _normalize_imdb_id(imdb_value)
+
+    if not imdb_id:
+        return None
+
+    response = requests.get(
+        f"https://api.themoviedb.org/3/find/{imdb_id}",
+        params={
+            "api_key": api_key,
+            "external_source": "imdb_id",
+            "language": "en-US",
+        },
+        timeout=5,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    movies = payload.get("movie_results") or []
+
+    if not movies:
+        return None
+
+    original_title = str(
+        movies[0].get("original_title") or ""
+    ).strip()
+
+    return original_title or None
+
+
+def _release_merge_key(item: dict) -> str:
+    """Generate the same title-based dedupe key for merged search sources."""
+    title = str(
+        item.get("title") or ""
+    ).strip().lower()
+
+    title = re.sub(
+        r"\.(mkv|mp4|avi|mov|wmv|m2ts|ts|nzb)$",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    )
+
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        title,
+    ).strip()
+
+
 def encode_id(item: dict) -> str:
     # Pack info needed to build NZB for a single selection and preserve title for filename
     payload = {
@@ -1178,6 +1257,153 @@ def api():
                     strict_match=strict_requested,
                 )
 
+        # Preserve the title/token set that the posted-NZB fallback
+        # should use. If TMDB resolves a different original movie title,
+        # these are switched to that title below.
+        posted_base_query = base_query
+        posted_query_tokens = query_tokens
+        posted_strict_phrase = strict_phrase
+
+        # Optional IMDb -> TMDB original-title fallback.
+        #
+        # AIOStreams sends imdbid for movie requests. When the normal
+        # Easynews VIDEO search produces few results, resolve only TMDB's
+        # canonical original_title and retry Easynews V3 with that title.
+        tmdb_title_fallback_enabled = (
+            os.environ.get(
+                "EASYNEWS_TMDB_ORIGINAL_TITLE_FALLBACK",
+                "false",
+            ).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
+        try:
+            tmdb_title_trigger = max(
+                0,
+                int(
+                    os.environ.get(
+                        "EASYNEWS_V3_NZB_TRIGGER",
+                        "20",
+                    )
+                ),
+            )
+        except ValueError:
+            tmdb_title_trigger = 20
+
+        if (
+            not fallback_query
+            and t == "movie"
+            and tmdb_title_fallback_enabled
+            and len(items) < tmdb_title_trigger
+        ):
+            imdb_param = (
+                request.args.get("imdbid")
+                or request.args.get("imdb")
+            )
+
+            try:
+                original_title = _tmdb_original_title(imdb_param)
+
+                requested_title_key = re.sub(
+                    r"\s+",
+                    " ",
+                    str(base_query or "").strip(),
+                ).casefold()
+
+                original_title_key = re.sub(
+                    r"\s+",
+                    " ",
+                    str(original_title or "").strip(),
+                ).casefold()
+
+                if (
+                    original_title
+                    and original_title_key
+                    and original_title_key != requested_title_key
+                ):
+                    alias_components = [original_title]
+
+                    if (
+                        year_int
+                        and str(year_int) not in original_title
+                    ):
+                        alias_components.append(str(year_int))
+
+                    alias_query = " ".join(alias_components).strip()
+                    alias_tokens = _tokenize(alias_query)
+
+                    alias_strict_phrase = (
+                        _sanitize_phrase(alias_query)
+                        if strict_requested
+                        else None
+                    )
+
+                    APP.logger.info(
+                        "TMDB original-title fallback: %r -> %r",
+                        base_query,
+                        original_title,
+                    )
+
+                    # V3-only retry. This deliberately does not invoke
+                    # Easynews V2 fallback behavior.
+                    alias_data = c._search_v3(
+                        query=alias_query,
+                        file_type="VIDEO",
+                        per_page=250,
+                        sort_field="relevance",
+                        sort_dir="-",
+                    )
+
+                    alias_items = filter_and_map(
+                        alias_data,
+                        min_bytes=min_bytes,
+                        query_tokens=alias_tokens,
+                        query_meta=query_meta,
+                        strict_phrase=alias_strict_phrase,
+                        strict_match=strict_requested,
+                    )
+
+                    existing_keys = {
+                        _release_merge_key(item)
+                        for item in items
+                        if _release_merge_key(item)
+                    }
+
+                    alias_added = 0
+
+                    for alias_item in alias_items:
+                        key = _release_merge_key(alias_item)
+
+                        if key and key in existing_keys:
+                            continue
+
+                        items.append(alias_item)
+
+                        if key:
+                            existing_keys.add(key)
+
+                        alias_added += 1
+
+                    APP.logger.info(
+                        "TMDB original-title fallback added %s "
+                        "Easynews VIDEO release(s)",
+                        alias_added,
+                    )
+
+                    # Even if VIDEO returned nothing, let the existing
+                    # posted-NZB fallback search the resolved original title.
+                    posted_base_query = original_title
+                    posted_query_tokens = alias_tokens
+                    posted_strict_phrase = alias_strict_phrase
+
+            except Exception as e:
+                # Metadata lookup must never break normal Easynews results.
+                APP.logger.warning(
+                    "TMDB original-title fallback failed for imdbid=%r: %s",
+                    imdb_param,
+                    e,
+                )
+
         # Optional Easynews V3 posted-NZB fallback.
         #
         # Normal VIDEO search remains the primary path. Only when it
@@ -1248,8 +1474,8 @@ def api():
                 #
                 # TV searches keep SxxExx/Sxx in the query to avoid an
                 # unnecessarily huge title-only result set.
-                if t == "movie" and base_query:
-                    broad_query = base_query
+                if t == "movie" and posted_base_query:
+                    broad_query = posted_base_query
                 else:
                     broad_query = q
 
@@ -1274,9 +1500,9 @@ def api():
                         c,
                         broad_data,
                         min_bytes=min_bytes,
-                        query_tokens=query_tokens,
+                        query_tokens=posted_query_tokens,
                         query_meta=query_meta,
-                        strict_phrase=strict_phrase,
+                        strict_phrase=posted_strict_phrase,
                         strict_match=strict_requested,
                         max_candidates=max_candidates,
                         concurrency=nzb_concurrency,
@@ -1284,34 +1510,16 @@ def api():
 
                     # Avoid obvious duplicates between normal VIDEO
                     # results and posted-NZB releases.
-                    def merge_key(item: dict) -> str:
-                        title = str(
-                            item.get("title") or ""
-                        ).strip().lower()
-
-                        title = re.sub(
-                            r"\.(mkv|mp4|avi|mov|wmv|m2ts|ts|nzb)$",
-                            "",
-                            title,
-                            flags=re.IGNORECASE,
-                        )
-
-                        return re.sub(
-                            r"[^a-z0-9]+",
-                            " ",
-                            title,
-                        ).strip()
-
                     existing_keys = {
-                        merge_key(item)
+                        _release_merge_key(item)
                         for item in items
-                        if merge_key(item)
+                        if _release_merge_key(item)
                     }
 
                     added = 0
 
                     for posted_item in posted_items:
-                        key = merge_key(posted_item)
+                        key = _release_merge_key(posted_item)
 
                         if key and key in existing_keys:
                             continue
