@@ -400,7 +400,22 @@ class EasynewsClient:
                 for future in as_completed(futures):
                     pno = futures[future]
                     try:
-                        page_results[pno] = future.result()
+                        response = future.result()
+                        response_data = response.get("data", [])
+
+                        try:
+                            response_page = int(response.get("page"))
+                        except (TypeError, ValueError):
+                            response_page = -1
+
+                        if response_page != pno or not response_data:
+                            raise EasynewsError(
+                                "invalid Easynews V3 page response: "
+                                f"requested={pno}, response={response_page}, "
+                                f"rows={len(response_data) if isinstance(response_data, list) else 'invalid'}"
+                            )
+
+                        page_results[pno] = response
                     except Exception as e:
                         # Keep successful pages instead of failing the entire
                         # Prowlarr search because one secondary page failed.
@@ -428,7 +443,7 @@ class EasynewsClient:
             )
 
             try:
-                page_results[pno] = self._search_v3_page(
+                response = self._search_v3_page(
                     query=query,
                     page=pno,
                     file_type=file_type,
@@ -437,12 +452,27 @@ class EasynewsClient:
                     safe_off=safe_off,
                 )
 
+                response_data = response.get("data", [])
+
+                try:
+                    response_page = int(response.get("page"))
+                except (TypeError, ValueError):
+                    response_page = -1
+
+                if response_page != pno or not response_data:
+                    raise EasynewsError(
+                        "invalid Easynews V3 recovery response: "
+                        f"requested={pno}, response={response_page}, "
+                        f"rows={len(response_data) if isinstance(response_data, list) else 'invalid'}"
+                    )
+
+                page_results[pno] = response
+
                 logger.info(
                     "Recovered Easynews V3 page %s for query %r",
                     pno,
                     query,
                 )
-
             except Exception as e:
                 logger.warning(
                     "Easynews V3 page %s still unavailable after recovery "
@@ -451,7 +481,6 @@ class EasynewsClient:
                     query,
                     e,
                 )
-
         merged_data: List[Any] = []
         seen_hashes = set()
 
