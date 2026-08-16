@@ -7,7 +7,9 @@ Search support:
 - Optional automatic V3 -> V2 fallback
 - Parallel pagination for V3 searches
 
-NZB generation continues to use /2.0/api/dl-nzb.
+NZB retrieval:
+- Standard Easynews search results continue to use /2.0/api/dl-nzb
+- Posted .nzb documents discovered by V3 can be retrieved directly via Easynews NNTP
 
 Authentication uses HTTP Basic Auth with a valid Easynews account.
 """
@@ -17,7 +19,11 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import socket
+import ssl
 import time
+import xml.etree.ElementTree as ET
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -229,8 +235,12 @@ class EasynewsClient:
         V3 always returns up to 100 results per page and ignores page-size
         parameters such as pby/dni.
         """
-        if file_type != "VIDEO":
-            file_type = "VIDEO"
+        file_type_normalized = (file_type or "VIDEO").strip().upper()
+
+        # Easynews V3 broad search is performed by omitting fty[] entirely.
+        # Preserve the historical bridge behaviour for every other value:
+        # anything except ALL/ANY/* remains VIDEO-only.
+        broad_all_files = file_type_normalized in {"ALL", "ANY", "*"}
 
         params = {
             "gps": query,
@@ -239,8 +249,10 @@ class EasynewsClient:
             "safeO": str(safe_off),
             "s1": sort_field or "relevance",
             "s1d": sort_dir,
-            "fty[]": file_type,
         }
+
+        if not broad_all_files:
+            params["fty[]"] = "VIDEO"
 
         url = f"{EASYNEWS_BASE}/3.0/api/search"
 
@@ -319,9 +331,8 @@ class EasynewsClient:
         Page 1 is fetched first to learn numPages. Remaining pages are fetched
         concurrently and merged. Duplicate hashes are removed.
         """
-        if file_type != "VIDEO":
-            file_type = "VIDEO"
-
+        # Keep the caller's selector intact. _search_v3_page() interprets
+        # ALL/ANY/* as a broad search with no fty[] parameter.
         first_page_num = max(1, int(page))
 
         first = self._search_v3_page(
@@ -672,6 +683,343 @@ class EasynewsClient:
             data["nameZipQ0"] = name
         # The site posts to /2.0/api/dl-nzb and returns the NZB file content (application/x-nzb or xml)
         return data
+
+    def download_posted_nzb(self, message_id: str) -> bytes:
+        """
+        Fetch an NZB file that was itself posted to Usenet.
+
+        The V3 search result supplies the article Message-ID. This method
+        retrieves that article from Easynews NNTP, decodes the yEnc payload,
+        validates size/CRC/XML, and returns the original NZB bytes.
+
+        For now, multipart-posted NZB documents are rejected explicitly.
+        """
+        host = os.environ.get(
+            "EASYNEWS_NNTP_HOST", "news.easynews.com"
+        ).strip()
+
+        try:
+            port = int(os.environ.get("EASYNEWS_NNTP_PORT", "563"))
+            timeout = float(os.environ.get("EASYNEWS_NNTP_TIMEOUT", "20"))
+        except ValueError as e:
+            raise EasynewsError(
+                f"Invalid Easynews NNTP configuration: {e}"
+            ) from e
+
+        mid = (message_id or "").strip()
+
+        if not mid:
+            raise EasynewsError("Missing NNTP Message-ID")
+
+        if not mid.startswith("<"):
+            mid = f"<{mid}>"
+
+        def parse_fields(line: bytes) -> Dict[str, str]:
+            fields: Dict[str, str] = {}
+            text = line.decode("utf-8", "replace")
+
+            for token in text.split()[1:]:
+                if "=" in token:
+                    key, value = token.split("=", 1)
+                    fields[key.lower()] = value
+
+            return fields
+
+        def decode_yenc(data: bytes) -> bytes:
+            out = bytearray()
+            escaped = False
+
+            for b in data:
+                if escaped:
+                    b = (b - 64) & 0xFF
+                    out.append((b - 42) & 0xFF)
+                    escaped = False
+
+                elif b == 61:  # "="
+                    escaped = True
+
+                else:
+                    out.append((b - 42) & 0xFF)
+
+            if escaped:
+                raise EasynewsError("Truncated yEnc escape sequence")
+
+            return bytes(out)
+
+        context = ssl.create_default_context()
+
+        try:
+            with socket.create_connection(
+                (host, port),
+                timeout=timeout,
+            ) as raw_sock:
+
+                with context.wrap_socket(
+                    raw_sock,
+                    server_hostname=host,
+                ) as sock:
+
+                    stream = sock.makefile("rwb", buffering=0)
+
+                    def read_line() -> bytes:
+                        line = stream.readline()
+
+                        if not line:
+                            raise EasynewsError(
+                                "NNTP connection closed unexpectedly"
+                            )
+
+                        return line
+
+                    def command(text: str) -> str:
+                        stream.write(
+                            (text + "\r\n").encode("utf-8")
+                        )
+
+                        return (
+                            read_line()
+                            .decode("utf-8", "replace")
+                            .rstrip()
+                        )
+
+                    greeting = (
+                        read_line()
+                        .decode("utf-8", "replace")
+                        .rstrip()
+                    )
+
+                    if not greeting.startswith(("200", "201")):
+                        raise EasynewsError(
+                            f"NNTP greeting failed: {greeting}"
+                        )
+
+                    auth = command(
+                        f"AUTHINFO USER {self.username}"
+                    )
+
+                    if auth.startswith("381"):
+                        stream.write(
+                            (
+                                f"AUTHINFO PASS {self.password}\r\n"
+                            ).encode("utf-8")
+                        )
+
+                        auth = (
+                            read_line()
+                            .decode("utf-8", "replace")
+                            .rstrip()
+                        )
+
+                    if not auth.startswith("281"):
+                        raise EasynewsError(
+                            f"NNTP authentication failed: {auth}"
+                        )
+
+                    body_status = command(f"BODY {mid}")
+
+                    if not body_status.startswith("222"):
+                        raise EasynewsError(
+                            f"NNTP article unavailable for {mid}: "
+                            f"{body_status}"
+                        )
+
+                    encoded = bytearray()
+
+                    ybegin_fields: Dict[str, str] = {}
+                    ypart_fields: Dict[str, str] = {}
+                    yend_fields: Dict[str, str] = {}
+
+                    in_payload = False
+
+                    while True:
+                        line = read_line().rstrip(b"\r\n")
+
+                        if line == b".":
+                            break
+
+                        # NNTP dot-unstuffing.
+                        if line.startswith(b".."):
+                            line = line[1:]
+
+                        if line.startswith(b"=ybegin "):
+                            ybegin_fields = parse_fields(line)
+                            in_payload = True
+
+                            try:
+                                total = int(
+                                    ybegin_fields.get("total", "1")
+                                )
+                            except ValueError:
+                                total = 1
+
+                            if total > 1:
+                                raise EasynewsError(
+                                    "Multipart-posted NZB document "
+                                    "is not supported yet "
+                                    f"(yEnc total={total})"
+                                )
+
+                            continue
+
+                        if line.startswith(b"=ypart "):
+                            ypart_fields = parse_fields(line)
+                            continue
+
+                        if line.startswith(b"=yend "):
+                            yend_fields = parse_fields(line)
+                            in_payload = False
+                            continue
+
+                        if in_payload:
+                            encoded.extend(line)
+
+        except EasynewsError:
+            raise
+
+        except (OSError, ssl.SSLError) as e:
+            raise EasynewsError(
+                f"Easynews NNTP request failed: {e}"
+            ) from e
+
+        if not ybegin_fields:
+            raise EasynewsError(
+                "NNTP article did not contain a yEnc header"
+            )
+
+        if not yend_fields:
+            raise EasynewsError(
+                "NNTP article did not contain a yEnc trailer"
+            )
+
+        decoded = decode_yenc(bytes(encoded))
+
+        expected_size: Optional[int] = None
+
+        try:
+            if (
+                ypart_fields.get("begin")
+                and ypart_fields.get("end")
+            ):
+                begin = int(ypart_fields["begin"])
+                end = int(ypart_fields["end"])
+                expected_size = end - begin + 1
+
+            elif ybegin_fields.get("size"):
+                expected_size = int(ybegin_fields["size"])
+
+        except ValueError as e:
+            raise EasynewsError(
+                f"Invalid yEnc size metadata: {e}"
+            ) from e
+
+        if (
+            expected_size is not None
+            and len(decoded) != expected_size
+        ):
+            raise EasynewsError(
+                "Decoded NZB size mismatch: "
+                f"expected {expected_size}, "
+                f"got {len(decoded)}"
+            )
+
+        if yend_fields.get("size"):
+            try:
+                yend_size = int(yend_fields["size"])
+            except ValueError as e:
+                raise EasynewsError(
+                    f"Invalid yEnc end size: {e}"
+                ) from e
+
+            if len(decoded) != yend_size:
+                raise EasynewsError(
+                    "Decoded NZB end-size mismatch: "
+                    f"expected {yend_size}, "
+                    f"got {len(decoded)}"
+                )
+
+        expected_crc = (
+            yend_fields.get("pcrc32")
+            or yend_fields.get("crc32")
+        )
+
+        if expected_crc:
+            actual_crc = (
+                f"{zlib.crc32(decoded) & 0xFFFFFFFF:08x}"
+            )
+
+            if actual_crc.lower() != expected_crc.lower():
+                raise EasynewsError(
+                    "Decoded NZB CRC mismatch: "
+                    f"expected {expected_crc}, "
+                    f"got {actual_crc}"
+                )
+
+        try:
+            root = ET.fromstring(decoded)
+
+        except ET.ParseError as e:
+            raise EasynewsError(
+                f"Decoded article is not valid NZB XML: {e}"
+            ) from e
+
+        if root.tag.rsplit("}", 1)[-1].lower() != "nzb":
+            raise EasynewsError(
+                "Decoded article XML root is not <nzb>"
+            )
+
+        return decoded
+
+
+    def inspect_posted_nzb(self, message_id: str) -> Dict[str, Any]:
+        """
+        Retrieve and inspect a posted NZB document.
+
+        Returns the original NZB bytes together with release-level metadata
+        derived from the NZB itself.
+        """
+        content = self.download_posted_nzb(message_id)
+
+        try:
+            root = ET.fromstring(content)
+        except ET.ParseError as e:
+            raise EasynewsError(
+                f"Posted NZB XML could not be parsed: {e}"
+            ) from e
+
+        files = [
+            node
+            for node in root.iter()
+            if node.tag.rsplit("}", 1)[-1].lower() == "file"
+        ]
+
+        segments = [
+            node
+            for node in root.iter()
+            if node.tag.rsplit("}", 1)[-1].lower() == "segment"
+        ]
+
+        total_bytes = 0
+
+        for segment in segments:
+            try:
+                total_bytes += int(segment.attrib.get("bytes", "0"))
+            except (TypeError, ValueError):
+                pass
+
+        subjects = [
+            node.attrib.get("subject", "").strip()
+            for node in files
+            if node.attrib.get("subject", "").strip()
+        ]
+
+        return {
+            "content": content,
+            "size": total_bytes,
+            "file_count": len(files),
+            "segment_count": len(segments),
+            "first_subject": subjects[0] if subjects else "",
+        }
+
 
     def download_nzb(self, payload: Dict[str, str], out_path: str) -> str:
         url = f"{EASYNEWS_BASE}/2.0/api/dl-nzb"
