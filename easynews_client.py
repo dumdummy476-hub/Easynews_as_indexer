@@ -411,6 +411,47 @@ class EasynewsClient:
                             e,
                         )
 
+        # A secondary page may still fail after its normal retry cycle.
+        # Before returning a partial result set, retry any missing pages once
+        # more sequentially. This avoids silently losing up to 100 results
+        # because of a transient Easynews connection failure.
+        missing_pages = [
+            pno for pno in remaining_pages
+            if pno not in page_results
+        ]
+
+        for pno in missing_pages:
+            logger.warning(
+                "Retrying missing Easynews V3 page %s sequentially for query %r",
+                pno,
+                query,
+            )
+
+            try:
+                page_results[pno] = self._search_v3_page(
+                    query=query,
+                    page=pno,
+                    file_type=file_type,
+                    sort_field=sort_field,
+                    sort_dir=sort_dir,
+                    safe_off=safe_off,
+                )
+
+                logger.info(
+                    "Recovered Easynews V3 page %s for query %r",
+                    pno,
+                    query,
+                )
+
+            except Exception as e:
+                logger.warning(
+                    "Easynews V3 page %s still unavailable after recovery "
+                    "attempt for query %r: %s",
+                    pno,
+                    query,
+                    e,
+                )
+
         merged_data: List[Any] = []
         seen_hashes = set()
 
