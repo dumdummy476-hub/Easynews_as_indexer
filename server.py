@@ -1347,6 +1347,130 @@ def api():
                     strict_match=strict_requested,
                 )
 
+        # Movie title-only VIDEO retry.
+        #
+        # Easynews V3 can sometimes return dramatically fewer results when
+        # the release year is appended to the search text. If the primary
+        # "title + year" search is weak, retry the same display title without
+        # the year while still enforcing the requested year via query_meta.
+        try:
+            title_only_trigger = max(
+                0,
+                int(
+                    os.environ.get(
+                        "EASYNEWS_V3_NZB_TRIGGER",
+                        "20",
+                    )
+                ),
+            )
+        except ValueError:
+            title_only_trigger = 20
+
+        if (
+            not fallback_query
+            and t == "movie"
+            and base_query
+            and year_int
+            and str(year_int) not in base_query
+            and len(items) < title_only_trigger
+        ):
+            title_only_query = base_query.strip()
+            title_only_tokens = _tokenize(title_only_query)
+
+            title_only_strict_phrase = (
+                _sanitize_phrase(title_only_query)
+                if strict_requested
+                else None
+            )
+
+            try:
+                APP.logger.info(
+                    "Easynews title-only VIDEO retry: %r -> %r "
+                    "(results=%s, trigger=%s)",
+                    q,
+                    title_only_query,
+                    len(items),
+                    title_only_trigger,
+                )
+
+                # V3-only retry: deliberately bypass the legacy V2 path.
+                title_only_data = c._search_v3(
+                    query=title_only_query,
+                    file_type="VIDEO",
+                    per_page=250,
+                    sort_field="relevance",
+                    sort_dir="-",
+                )
+
+                # The generic release-marker parser may mistake a
+                # four-digit number in the movie title itself for a year
+                # (for example "Blade Runner 2049"). For this title-only
+                # recovery pass, enforce all other metadata normally but
+                # validate the requested movie year explicitly against the
+                # resulting release title instead.
+                title_only_meta = dict(query_meta)
+                title_only_meta.pop("year", None)
+
+                title_only_items = filter_and_map(
+                    title_only_data,
+                    min_bytes=min_bytes,
+                    query_tokens=title_only_tokens,
+                    query_meta=title_only_meta,
+                    strict_phrase=title_only_strict_phrase,
+                    strict_match=strict_requested,
+                )
+
+                if year_int:
+                    requested_year_pattern = re.compile(
+                        rf"(?<!\d){re.escape(str(year_int))}(?!\d)"
+                    )
+
+                    title_only_items = [
+                        item
+                        for item in title_only_items
+                        if requested_year_pattern.search(
+                            str(
+                                item.get("title")
+                                or item.get("filename")
+                                or ""
+                            )
+                        )
+                    ]
+
+                existing_keys = {
+                    _release_merge_key(item)
+                    for item in items
+                    if _release_merge_key(item)
+                }
+
+                title_only_added = 0
+
+                for title_only_item in title_only_items:
+                    key = _release_merge_key(title_only_item)
+
+                    if key and key in existing_keys:
+                        continue
+
+                    items.append(title_only_item)
+
+                    if key:
+                        existing_keys.add(key)
+
+                    title_only_added += 1
+
+                APP.logger.info(
+                    "Easynews title-only VIDEO retry added %s release(s)",
+                    title_only_added,
+                )
+
+            except Exception as e:
+                # This retry must never break the normal search path.
+                APP.logger.warning(
+                    "Easynews title-only VIDEO retry failed for %r: %s",
+                    title_only_query,
+                    e,
+                )
+
         # Preserve the title/token set that the posted-NZB fallback
         # should use. If TMDB resolves a different original movie title,
         # these are switched to that title below.
