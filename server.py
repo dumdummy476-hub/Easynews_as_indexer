@@ -241,6 +241,31 @@ def _release_merge_key(item: dict) -> str:
     ).strip()
 
 
+def _merge_new_items(items: List[dict], new_items: List[dict]) -> int:
+    """
+    Append entries from new_items that don't already match an item in
+    items by _release_merge_key. Mutates items in place; returns the
+    number of entries added.
+    """
+    existing_keys = {
+        _release_merge_key(item)
+        for item in items
+        if _release_merge_key(item)
+    }
+
+    added = 0
+    for candidate in new_items:
+        key = _release_merge_key(candidate)
+        if key and key in existing_keys:
+            continue
+        items.append(candidate)
+        if key:
+            existing_keys.add(key)
+        added += 1
+
+    return added
+
+
 def encode_id(item: dict) -> str:
     # Pack info needed to build NZB for a single selection and preserve title for filename
     payload = {
@@ -713,6 +738,65 @@ def _detect_category(title: str, metadata: Dict[str, Optional[Any]]) -> int:
     return CATEGORY_MOVIES  # 2000
 
 
+def _title_passes_filters(
+    title: str,
+    quality_hint: Optional[str],
+    query_tokens: Optional[Any],
+    query_meta: Optional[Dict[str, Optional[Any]]],
+    strict_phrase: Optional[str],
+    strict_match: bool,
+) -> Optional[Dict[str, Optional[Any]]]:
+    """
+    Clean a candidate title and apply the strict-phrase, query-metadata,
+    and token-subset filters shared by normal VIDEO results and posted-NZB
+    candidates.
+
+    Returns None if the title is rejected by any filter, otherwise a dict
+    with the cleaned title plus extracted quality/year/season/episode.
+    """
+    cleaned_title = _clean_mojibake_title(title)
+
+    quality = _extract_quality(cleaned_title, quality_hint)
+    title_meta = _extract_release_markers(cleaned_title, quality)
+    if not quality and title_meta.get("quality"):
+        quality = title_meta.get("quality")
+
+    if strict_match and not _matches_strict(cleaned_title, strict_phrase):
+        return None
+
+    if query_meta:
+        q_year = query_meta.get("year")
+        q_season = query_meta.get("season")
+        q_episode = query_meta.get("episode")
+        q_quality = query_meta.get("quality")
+        t_year = title_meta.get("year")
+        t_season = title_meta.get("season")
+        t_episode = title_meta.get("episode")
+        t_quality = quality or title_meta.get("quality")
+
+        if q_year and t_year and q_year != t_year:
+            return None
+        if q_season is not None and t_season is not None and q_season != t_season:
+            return None
+        if q_episode is not None and t_episode is not None and q_episode != t_episode:
+            return None
+        if q_quality and t_quality and q_quality.lower() != t_quality.lower():
+            return None
+
+    if query_tokens:
+        title_tokens = set(_tokenize(cleaned_title))
+        if not title_tokens or not set(query_tokens).issubset(title_tokens):
+            return None
+
+    return {
+        "title": cleaned_title,
+        "quality": quality,
+        "year": title_meta.get("year"),
+        "season": title_meta.get("season"),
+        "episode": title_meta.get("episode"),
+    }
+
+
 def _matches_strict(title: str, strict_phrase: Optional[str]) -> bool:
     if not strict_phrase:
         return True
@@ -846,42 +930,23 @@ def filter_and_map(
 
         # Easynews occasionally returns multiply-encoded garbage inside
         # bracketed release-group suffixes. Clean display title only.
-        title = _clean_mojibake_title(title)
-
-        quality = _extract_quality(title, fullres)
-        title_meta = _extract_release_markers(title, quality)
-        if not quality and title_meta.get("quality"):
-            quality = title_meta.get("quality")
-
-        if strict_match and not _matches_strict(title, strict_phrase):
+        filter_result = _title_passes_filters(
+            title,
+            quality_hint=fullres,
+            query_tokens=token_set,
+            query_meta=query_meta,
+            strict_phrase=strict_phrase,
+            strict_match=strict_match,
+        )
+        if filter_result is None:
             continue
 
-        if query_meta:
-            q_year = query_meta.get("year")
-            q_season = query_meta.get("season")
-            q_episode = query_meta.get("episode")
-            q_quality = query_meta.get("quality")
-            t_year = title_meta.get("year")
-            t_season = title_meta.get("season")
-            t_episode = title_meta.get("episode")
-            t_quality = quality or title_meta.get("quality")
-            if q_year and t_year and q_year != t_year:
-                continue
-            if q_season and t_season and q_season != t_season:
-                continue
-            if q_episode and t_episode and q_episode != t_episode:
-                continue
-            if q_quality and t_quality and q_quality.lower() != t_quality.lower():
-                continue
-
-        if token_set:
-            title_tokens = set(_tokenize(title))
-            if not title_tokens or not token_set.issubset(title_tokens):
-                continue
+        title = filter_result["title"]
+        quality = filter_result["quality"]
 
         duration_formatted = _format_duration(duration_seconds)
         thumbnail_url = _build_thumbnail_url(thumb_base, hash_id, filename_no_ext)
-        year = title_meta.get("year")
+        year = filter_result["year"]
 
         out.append(
             {
@@ -898,8 +963,8 @@ def filter_and_map(
                 "quality": quality,
                 "thumbnail": thumbnail_url,
                 "year": year,
-                "season": title_meta.get("season"),
-                "episode": title_meta.get("episode"),
+                "season": filter_result["season"],
+                "episode": filter_result["episode"],
 
                 # Easynews V3 metadata retained for Newznab output
                 "resolution_raw": resolution_raw,
@@ -1041,63 +1106,20 @@ def map_posted_nzbs(
         ]
         title = ".".join(parts)
 
-        title = _clean_mojibake_title(title)
-
-        quality = _extract_quality(title, None)
-        title_meta = _extract_release_markers(title, quality)
-
-        if not quality and title_meta.get("quality"):
-            quality = title_meta.get("quality")
-
-        if strict_match and not _matches_strict(
+        filter_result = _title_passes_filters(
             title,
-            strict_phrase,
-        ):
+            quality_hint=None,
+            query_tokens=token_set,
+            query_meta=query_meta,
+            strict_phrase=strict_phrase,
+            strict_match=strict_match,
+        )
+
+        if filter_result is None:
             continue
 
-        if query_meta:
-            q_year = query_meta.get("year")
-            q_season = query_meta.get("season")
-            q_episode = query_meta.get("episode")
-            q_quality = query_meta.get("quality")
-
-            t_year = title_meta.get("year")
-            t_season = title_meta.get("season")
-            t_episode = title_meta.get("episode")
-            t_quality = quality or title_meta.get("quality")
-
-            if q_year and t_year and q_year != t_year:
-                continue
-
-            if (
-                q_season is not None
-                and t_season is not None
-                and q_season != t_season
-            ):
-                continue
-
-            if (
-                q_episode is not None
-                and t_episode is not None
-                and q_episode != t_episode
-            ):
-                continue
-
-            if (
-                q_quality
-                and t_quality
-                and q_quality.lower() != t_quality.lower()
-            ):
-                continue
-
-        if token_set:
-            title_tokens = set(_tokenize(title))
-
-            if (
-                not title_tokens
-                or not token_set.issubset(title_tokens)
-            ):
-                continue
+        title = filter_result["title"]
+        quality = filter_result["quality"]
 
         posted_raw = (
             it.get("timestamp")
@@ -1122,9 +1144,9 @@ def map_posted_nzbs(
                 "duration_hms": None,
                 "quality": quality,
                 "thumbnail": None,
-                "year": title_meta.get("year"),
-                "season": title_meta.get("season"),
-                "episode": title_meta.get("episode"),
+                "year": filter_result["year"],
+                "season": filter_result["season"],
+                "episode": filter_result["episode"],
 
                 "resolution_raw": None,
                 "video_codec": None,
@@ -1548,26 +1570,7 @@ def api():
                         )
                     ]
 
-                existing_keys = {
-                    _release_merge_key(item)
-                    for item in items
-                    if _release_merge_key(item)
-                }
-
-                title_only_added = 0
-
-                for title_only_item in title_only_items:
-                    key = _release_merge_key(title_only_item)
-
-                    if key and key in existing_keys:
-                        continue
-
-                    items.append(title_only_item)
-
-                    if key:
-                        existing_keys.add(key)
-
-                    title_only_added += 1
+                title_only_added = _merge_new_items(items, title_only_items)
 
                 APP.logger.info(
                     "Easynews title-only VIDEO retry added %s release(s)",
@@ -1579,6 +1582,77 @@ def api():
                 APP.logger.warning(
                     "Easynews title-only VIDEO retry failed for %r: %s",
                     title_only_query,
+                    e,
+                )
+
+        # TV season-pack retry.
+        #
+        # A search for a specific "S01E05" can return far fewer hits than
+        # a season-only search: episode-number formatting varies between
+        # releases (S01E05 vs 1x05 vs "Episode 5"), and some releases are
+        # only discoverable via a season-pack-style title. If the primary
+        # SxxExx search is weak, retry with the episode dropped from the
+        # query text while still enforcing the requested season/episode
+        # via query_meta.
+        if (
+            not fallback_query
+            and t == "tvsearch"
+            and base_query
+            and season_int is not None
+            and episode_int is not None
+            and len(items) < title_only_trigger
+        ):
+            season_only_query = " ".join(
+                part
+                for part in (base_query, f"S{season_int:02}")
+                if part
+            ).strip()
+            season_only_tokens = _tokenize(base_query)
+
+            season_only_strict_phrase = (
+                _sanitize_phrase(base_query) if strict_requested else None
+            )
+
+            try:
+                APP.logger.info(
+                    "Easynews TV season-pack retry: %r -> %r "
+                    "(results=%s, trigger=%s)",
+                    q,
+                    season_only_query,
+                    len(items),
+                    title_only_trigger,
+                )
+
+                # V3-only retry: deliberately bypass the legacy V2 path.
+                season_only_data = c._search_v3(
+                    query=season_only_query,
+                    file_type="VIDEO",
+                    per_page=250,
+                    sort_field="relevance",
+                    sort_dir="-",
+                )
+
+                season_only_items = filter_and_map(
+                    season_only_data,
+                    min_bytes=min_bytes,
+                    query_tokens=season_only_tokens,
+                    query_meta=query_meta,
+                    strict_phrase=season_only_strict_phrase,
+                    strict_match=strict_requested,
+                )
+
+                season_only_added = _merge_new_items(items, season_only_items)
+
+                APP.logger.info(
+                    "Easynews TV season-pack retry added %s release(s)",
+                    season_only_added,
+                )
+
+            except Exception as e:
+                # This retry must never break the normal search path.
+                APP.logger.warning(
+                    "Easynews TV season-pack retry failed for %r: %s",
+                    season_only_query,
                     e,
                 )
 
@@ -1691,26 +1765,7 @@ def api():
                         strict_match=strict_requested,
                     )
 
-                    existing_keys = {
-                        _release_merge_key(item)
-                        for item in items
-                        if _release_merge_key(item)
-                    }
-
-                    alias_added = 0
-
-                    for alias_item in alias_items:
-                        key = _release_merge_key(alias_item)
-
-                        if key and key in existing_keys:
-                            continue
-
-                        items.append(alias_item)
-
-                        if key:
-                            existing_keys.add(key)
-
-                        alias_added += 1
+                    alias_added = _merge_new_items(items, alias_items)
 
                     APP.logger.info(
                         "TMDB original-title fallback added %s "
@@ -1729,6 +1784,116 @@ def api():
                 APP.logger.warning(
                     "TMDB original-title fallback failed for imdbid=%r: %s",
                     imdb_param,
+                    e,
+                )
+
+        # Optional TVDB -> TMDB original-name fallback.
+        #
+        # Sonarr can send tvdbid alongside q for tv-search requests. When
+        # the normal Easynews VIDEO search produces few results, resolve
+        # TMDB's canonical original_name for that TVDB ID (foreign-language
+        # or retitled shows often air under a different name locally) and
+        # retry Easynews V3 with it.
+        if (
+            not fallback_query
+            and t == "tvsearch"
+            and tmdb_title_fallback_enabled
+            and len(items) < tmdb_title_trigger
+        ):
+            tvdb_lookup_param = (
+                request.args.get("tvdbid")
+                or request.args.get("tvdb")
+            )
+
+            try:
+                original_name = tmdb_tv_original_name_hint
+
+                if not original_name and tvdb_lookup_param:
+                    resolved_tv = _tmdb_tv_titles_from_tvdb(tvdb_lookup_param)
+                    if resolved_tv:
+                        original_name = resolved_tv.get("original_name")
+
+                requested_title_key = re.sub(
+                    r"\s+",
+                    " ",
+                    str(base_query or "").strip(),
+                ).casefold()
+
+                original_title_key = re.sub(
+                    r"\s+",
+                    " ",
+                    str(original_name or "").strip(),
+                ).casefold()
+
+                if (
+                    original_name
+                    and original_title_key
+                    and original_title_key != requested_title_key
+                ):
+                    alias_components = [original_name]
+
+                    if season_int is not None and episode_int is not None:
+                        alias_components.append(
+                            f"S{season_int:02}E{episode_int:02}"
+                        )
+                    elif season_int is not None:
+                        alias_components.append(f"S{season_int:02}")
+
+                    alias_query = " ".join(
+                        part for part in alias_components if part
+                    ).strip()
+                    alias_tokens = _tokenize(alias_query)
+
+                    alias_strict_phrase = (
+                        _sanitize_phrase(alias_query)
+                        if strict_requested
+                        else None
+                    )
+
+                    APP.logger.info(
+                        "TMDB TV original-title fallback: %r -> %r",
+                        base_query,
+                        original_name,
+                    )
+
+                    # V3-only retry. This deliberately does not invoke
+                    # Easynews V2 fallback behavior.
+                    alias_data = c._search_v3(
+                        query=alias_query,
+                        file_type="VIDEO",
+                        per_page=250,
+                        sort_field="relevance",
+                        sort_dir="-",
+                    )
+
+                    alias_items = filter_and_map(
+                        alias_data,
+                        min_bytes=min_bytes,
+                        query_tokens=alias_tokens,
+                        query_meta=query_meta,
+                        strict_phrase=alias_strict_phrase,
+                        strict_match=strict_requested,
+                    )
+
+                    alias_added = _merge_new_items(items, alias_items)
+
+                    APP.logger.info(
+                        "TMDB TV original-title fallback added %s "
+                        "Easynews VIDEO release(s)",
+                        alias_added,
+                    )
+
+                    # Even if VIDEO returned nothing, let the existing
+                    # posted-NZB fallback search the resolved original name.
+                    posted_base_query = original_name
+                    posted_query_tokens = alias_tokens
+                    posted_strict_phrase = alias_strict_phrase
+
+            except Exception as e:
+                # Metadata lookup must never break normal Easynews results.
+                APP.logger.warning(
+                    "TMDB TV original-title fallback failed for tvdbid=%r: %s",
+                    tvdb_lookup_param,
                     e,
                 )
 
@@ -1801,9 +1966,27 @@ def api():
                 # still enforces the requested year.
                 #
                 # TV searches keep SxxExx/Sxx in the query to avoid an
-                # unnecessarily huge title-only result set.
+                # unnecessarily huge title-only result set, but still use
+                # posted_base_query so a TMDB-resolved original show name
+                # is searched instead of the requested one.
                 if t == "movie" and posted_base_query:
                     broad_query = posted_base_query
+                elif t == "tvsearch" and posted_base_query:
+                    broad_query = " ".join(
+                        part
+                        for part in (
+                            posted_base_query,
+                            (
+                                f"S{season_int:02}E{episode_int:02}"
+                                if season_int is not None
+                                and episode_int is not None
+                                else f"S{season_int:02}"
+                                if season_int is not None
+                                else ""
+                            ),
+                        )
+                        if part
+                    ).strip()
                 else:
                     broad_query = q
 
@@ -1838,26 +2021,7 @@ def api():
 
                     # Avoid obvious duplicates between normal VIDEO
                     # results and posted-NZB releases.
-                    existing_keys = {
-                        _release_merge_key(item)
-                        for item in items
-                        if _release_merge_key(item)
-                    }
-
-                    added = 0
-
-                    for posted_item in posted_items:
-                        key = _release_merge_key(posted_item)
-
-                        if key and key in existing_keys:
-                            continue
-
-                        items.append(posted_item)
-
-                        if key:
-                            existing_keys.add(key)
-
-                        added += 1
+                    added = _merge_new_items(items, posted_items)
 
                     APP.logger.info(
                         "Easynews posted-NZB fallback added %s "
