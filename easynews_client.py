@@ -357,10 +357,10 @@ class EasynewsClient:
         # bridge's 250-result V2 search while allowing overrides later.
         try:
             configured_max_pages = max(
-                1, int(os.environ.get("EASYNEWS_V3_MAX_PAGES", "3"))
+                1, int(os.environ.get("EASYNEWS_V3_MAX_PAGES", "5"))
             )
         except ValueError:
-            configured_max_pages = 3
+            configured_max_pages = 5
 
         pages_to_fetch = min(
             requested_pages,
