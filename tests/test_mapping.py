@@ -25,8 +25,20 @@ def test_sample_suffix_is_preserved_for_feature_length_media():
     assert [x["hash"] for x in items] == ["h1"]
 
 
-def test_short_duration_media_is_still_rejected():
-    short = {**row("Silo.S03E04.2160p.WEB.H265-CAKES-sample"), "runtime": 30}
+def test_large_media_with_59_second_easynews_duration_is_preserved():
+    suspicious = {
+        **row("silo.s03e04.multi.hdr.2160p.web.h265-higgsboson-sample", 160 * 1024 * 1024),
+        "runtime": 59,
+    }
+    items = map_results({"data": [suspicious]}, 100 * 1024 * 1024, "Silo", season=3, episode=4)
+    assert [x["hash"] for x in items] == ["h1"]
+
+
+def test_genuinely_tiny_short_preview_is_rejected():
+    short = {
+        **row("Silo.S03E04.720p.WEB.H264-preview", 30 * 1024 * 1024),
+        "runtime": 30,
+    }
     items = map_results({"data": [short]}, 1, "Silo", season=3, episode=4)
     assert items == []
 
