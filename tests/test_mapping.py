@@ -29,3 +29,20 @@ def test_short_duration_media_is_still_rejected():
     short = {**row("Silo.S03E04.2160p.WEB.H265-CAKES-sample"), "runtime": 30}
     items = map_results({"data": [short]}, 1, "Silo", season=3, episode=4)
     assert items == []
+
+
+def test_strict_tv_match_allows_year_between_title_and_episode():
+    full_episode = row(
+        "Silo.2023.S03E04.Whatever.You.Do.Dont.Go.Home.2160p.ATVP.WEB-DL.DDP5.1.Atmos.HDR10Plus.H.265-ALANSARI87",
+        9_234_000_000,
+    )
+    full_episode["runtime"] = 2866
+    items = map_results(
+        {"data": [full_episode]},
+        100 * 1024 * 1024,
+        "Silo S03E04",
+        season=3,
+        episode=4,
+        strict=True,
+    )
+    assert [x["hash"] for x in items] == ["h1"]
