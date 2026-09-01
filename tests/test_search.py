@@ -1,5 +1,4 @@
 from dataclasses import replace
-from easynews_indexer.client import EasynewsClient
 from easynews_indexer.config import Settings
 from easynews_indexer.search import SearchService
 
