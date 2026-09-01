@@ -28,7 +28,22 @@ def strict_match(title: str, phrase: str | None) -> bool:
     hay = cand.split()
     if cand == phrase:
         return True
-    return any(hay[i:i+len(needle)] == needle for i in range(0, max(0, len(hay)-len(needle)+1)))
+    if not needle:
+        return True
+
+    # Newznab TV/movie queries can carry structural tokens separated by
+    # metadata in release names. Example: "Silo S03E04" should match
+    # "Silo.2023.S03E04..." even though the year appears in between.
+    # Require the requested tokens in order rather than contiguously so
+    # strict mode still rejects re-ordered/noisy titles without dropping
+    # valid releases that insert a year or other metadata token.
+    pos = 0
+    for token in hay:
+        if token == needle[pos]:
+            pos += 1
+            if pos == len(needle):
+                return True
+    return False
 
 
 def parse_duration(value: Any) -> int | None:
