@@ -10,6 +10,7 @@ from .release import VIDEO_EXTS, parse_release
 
 TOKEN_SPLIT = re.compile(r"[^\w]+", re.UNICODE)
 STOPWORDS = {"the", "a", "an", "and", "of", "in", "for", "on"}
+NON_FEATURE_SUFFIX = re.compile(r"(?:^|[._\-\s])(?:sample|trailer)(?:[._\-\s]*\d+)?$", re.I)
 
 
 def tokenize(text: str) -> list[str]:
@@ -29,6 +30,11 @@ def strict_match(title: str, phrase: str | None) -> bool:
     if cand == phrase:
         return True
     return any(hay[i:i+len(needle)] == needle for i in range(0, max(0, len(hay)-len(needle)+1)))
+
+
+def is_non_feature_video(title: str) -> bool:
+    stem = re.sub(r"\.(mkv|mp4|avi|mov|wmv|m2ts|ts)$", "", title or "", flags=re.I)
+    return bool(NON_FEATURE_SUFFIX.search(stem))
 
 
 def parse_duration(value: Any) -> int | None:
@@ -124,6 +130,8 @@ def map_results(data: dict[str, Any], min_bytes: int, query: str = "", year: int
             if not title.lower().endswith(ext_text.lower()):
                 title += ext_text
         title = html.unescape(title)
+        if is_non_feature_video(title):
+            continue
         info = parse_release(title, meta)
         if year and info.year and info.year != year:
             continue
