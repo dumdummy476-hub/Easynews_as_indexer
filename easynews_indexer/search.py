@@ -91,7 +91,14 @@ class SearchService:
                 min_bytes = min_size_mb * 1024 * 1024
                 items = self._map(self._search_once(actual_query, deadline), min_bytes=min_bytes, query=actual_query,
                                   year=year, season=season, episode=episode, categories=categories, strict=strict, maxage=maxage)
-                if kind == "movie" and year and len(items) < self.settings.title_retry_trigger and self._within(deadline):
+                # Easynews relevance can hide valid releases when the movie year is
+                # included in the search phrase. Live regression testing showed large
+                # gains for titles such as The Matrix, Parasite and Mad Max Fury Road
+                # even when the year-specific query already returned many results.
+                # Always supplement with the title-only query when we appended the
+                # year ourselves, then dedupe the merged release set below.
+                if (kind == "movie" and year and base_query and
+                        actual_query.casefold() != base_query.casefold() and self._within(deadline)):
                     METRICS.inc("title_retries_total")
                     items.extend(self._map(self._search_once(base_query, deadline), min_bytes=min_bytes, query=base_query,
                                            year=year, season=season, episode=episode, categories=categories, strict=strict, maxage=maxage))
