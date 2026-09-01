@@ -10,6 +10,7 @@ from .release import VIDEO_EXTS, parse_release
 
 TOKEN_SPLIT = re.compile(r"[^\w]+", re.UNICODE)
 STOPWORDS = {"the", "a", "an", "and", "of", "in", "for", "on"}
+SHORT_PREVIEW_MAX_BYTES = 100 * 1024 * 1024
 
 
 def tokenize(text: str) -> list[str]:
@@ -131,7 +132,11 @@ def map_results(data: dict[str, Any], min_bytes: int, query: str = "", year: int
         if not hash_id or ext_text.lower() not in VIDEO_EXTS or size < min_bytes:
             continue
         duration_s = parse_duration(duration)
-        if duration_s is not None and duration_s < 60:
+        # Easynews duration metadata is not reliable enough to be a hard
+        # feature-length gate: known full, playable releases can report 59s.
+        # Keep large files even when duration is suspiciously short, while
+        # still filtering genuinely tiny preview/clip candidates.
+        if duration_s is not None and duration_s < 60 and size < SHORT_PREVIEW_MAX_BYTES:
             continue
         title = str(filename or subject or "").strip()
         if filename:
