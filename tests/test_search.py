@@ -63,6 +63,20 @@ class HighVolumeMovieClient:
                     "size": 2_000_000_000,
                     "runtime": 7900,
                 },
+                {
+                    "hash": "noise-tv",
+                    "fn": "Criminal.Minds.S05E14.Parasite.1080p.WEB-DL",
+                    "extension": ".mkv",
+                    "size": 3_000_000_000,
+                    "runtime": 2700,
+                },
+                {
+                    "hash": "noise-other",
+                    "fn": "30.Parasite.Mansion.avi",
+                    "extension": ".avi",
+                    "size": 900_000_000,
+                    "runtime": 5400,
+                },
             ]
         else:
             rows = []
@@ -111,3 +125,5 @@ def test_movie_title_expansion_runs_even_when_primary_result_count_is_high():
     assert len(results) == 26
     assert sum(1 for item in results if item["hash"] == "h0") == 1
     assert any(item["hash"] == "extra" for item in results)
+    assert not any(item["hash"] == "noise-tv" for item in results)
+    assert not any(item["hash"] == "noise-other" for item in results)
