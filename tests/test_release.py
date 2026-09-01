@@ -15,3 +15,11 @@ def test_rich_release_parser():
 
 def test_title_number_is_not_forced_to_requested_year():
     assert parse_release("Blade.Runner.2049.2017.1080p.mkv").year == 2017
+
+
+def test_release_group_year_does_not_override_movie_year():
+    info = parse_release(
+        "Blade.Runner.2049.2017.1080p.BluRay.DDP.7.1.H.265-EDGE2020.mkv"
+    )
+    assert info.year == 2017
+    assert info.group == "EDGE2020"
