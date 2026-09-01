@@ -19,17 +19,13 @@ def test_parent_query_tokens_filter_noise():
     assert [x["hash"] for x in items] == ["h1"]
 
 
-def test_sample_and_trailer_suffixes_are_rejected():
-    data = {"data": [
-        row("Movie.2025.2160p.WEB-DL-sample"),
-        {**row("Movie.2025.2160p.WEB-DL-trailer"), "hash":"h2"},
-        {**row("Movie.2025.2160p.WEB-DL"), "hash":"h3"},
-    ]}
-    items = map_results(data, 1, "Movie", year=2025)
-    assert [x["hash"] for x in items] == ["h3"]
-
-
-def test_sample_word_inside_real_title_is_not_rejected():
-    data = {"data": [row("The.Sample.2025.2160p.WEB-DL")]}
-    items = map_results(data, 1, "The Sample", year=2025)
+def test_sample_suffix_is_preserved_for_feature_length_media():
+    data = {"data": [row("Silo.S03E04.2160p.WEB.H265-CAKES-sample")]}
+    items = map_results(data, 1, "Silo", season=3, episode=4)
     assert [x["hash"] for x in items] == ["h1"]
+
+
+def test_short_duration_media_is_still_rejected():
+    short = {**row("Silo.S03E04.2160p.WEB.H265-CAKES-sample"), "runtime": 30}
+    items = map_results({"data": [short]}, 1, "Silo", season=3, episode=4)
+    assert items == []
