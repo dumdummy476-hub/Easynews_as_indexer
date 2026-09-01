@@ -70,7 +70,16 @@ def create_app(settings: Settings | None = None, service: SearchService | None =
     @app.get("/readyz")
     def readyz():
         if not settings.easynews_user or not settings.easynews_pass or not settings.api_key or settings.api_key == "testkey":
-            return jsonify(status="not_ready", reason="configuration"), 503
+            return jsonify(status="not_ready", reason="configuration", upstream_validated=False), 503
+        deep = (request.args.get("deep") or "").lower() in {"1", "true", "yes", "on"}
+        if deep:
+            if not authorized():
+                return jsonify(status="unauthorized", upstream_validated=False), 401
+            try:
+                svc.validate()
+            except Exception as exc:
+                app.logger.warning("Deep Easynews readiness validation failed: %s", exc)
+                return jsonify(status="not_ready", reason="upstream", upstream_validated=False), 503
         return jsonify(status="ready" if svc.ready else "configured", upstream_validated=svc.ready)
 
     @app.get("/metrics")
