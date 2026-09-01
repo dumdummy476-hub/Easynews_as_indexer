@@ -44,11 +44,20 @@ def parse_release(title: str, metadata: dict[str, Any] | None = None) -> Release
     if m:
         info.season = int(m.group("s") or m.group("s2"))
         info.episode = int(m.group("e") or m.group("e2"))
-    year_matches = list(YEAR_RE.finditer(t))
+
+    # Remove the file extension and trailing release-group token before
+    # looking for a movie year. Group names can legitimately contain a
+    # year-like suffix (for example EDGE2020), which must not override the
+    # actual release year in "Blade.Runner.2049.2017...-EDGE2020.mkv".
+    year_text = re.sub(r"\.[A-Za-z0-9]{2,5}$", "", t)
+    year_text = re.sub(r"-[A-Za-z0-9][A-Za-z0-9._-]{1,30}$", "", year_text)
+    year_matches = list(YEAR_RE.finditer(year_text))
     if year_matches:
-        # Release titles often contain a number that is also a valid year (e.g. Blade Runner 2049).
-        # The actual release year conventionally appears later, so prefer the last year-like token.
+        # A title itself can contain a year-like number (e.g. Blade Runner
+        # 2049), so after excluding the release group prefer the last
+        # remaining year-like token, which follows normal release naming.
         info.year = int(year_matches[-1].group(1))
+
     raw_res = str(metadata.get("resolution") or metadata.get("resolution_raw") or "")
     if "3840" in raw_res or "2160" in lower or "4k" in lower or "uhd" in lower:
         info.resolution = "2160p"
