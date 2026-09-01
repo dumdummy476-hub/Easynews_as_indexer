@@ -96,12 +96,24 @@ class SearchService:
                 # gains for titles such as The Matrix, Parasite and Mad Max Fury Road
                 # even when the year-specific query already returned many results.
                 # Always supplement with the title-only query when we appended the
-                # year ourselves, then dedupe the merged release set below.
+                # year ourselves. Because that broader query can also surface unrelated
+                # TV episodes or other works that merely share the title token, require
+                # supplemental candidates to parse back to the requested movie year.
                 if (kind == "movie" and year and base_query and
                         actual_query.casefold() != base_query.casefold() and self._within(deadline)):
                     METRICS.inc("title_retries_total")
-                    items.extend(self._map(self._search_once(base_query, deadline), min_bytes=min_bytes, query=base_query,
-                                           year=year, season=season, episode=episode, categories=categories, strict=strict, maxage=maxage))
+                    supplemental = self._map(
+                        self._search_once(base_query, deadline),
+                        min_bytes=min_bytes,
+                        query=base_query,
+                        year=year,
+                        season=season,
+                        episode=episode,
+                        categories=categories,
+                        strict=strict,
+                        maxage=maxage,
+                    )
+                    items.extend(item for item in supplemental if item.get("year") == year)
                 if kind == "movie" and self.settings.tmdb_enabled and len(items) < self.settings.tmdb_trigger and self._within(deadline):
                     if tmdb is None and imdbid: tmdb = self.tmdb.find(imdbid if imdbid.startswith("tt") else f"tt{imdbid}", "imdb_id")
                     original = (tmdb or {}).get("original")
