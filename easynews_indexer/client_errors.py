@@ -1,0 +1,2 @@
+class EasynewsError(Exception):
+    pass
